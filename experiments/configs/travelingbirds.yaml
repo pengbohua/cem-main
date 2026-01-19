@@ -118,7 +118,7 @@ runs:
 
   - architecture: "ConceptBottleneckModel"
     run_name: "DNN"
-    extra_dims: 100
+    extra_dims: 0
     kl_ratio: 0.01
     beta_max: 10
     concept_loss_weight: 0
