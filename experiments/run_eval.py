@@ -122,16 +122,15 @@ import cem.data.waterbirds_loader as waterbirds_data_module
 # import cem.train.training as training
 import cem.train.utils as utils
 
-import evaluate_models as evaluate_models
+import experiments.evaluate_models as evaluate_models
 import experiments.experiment_utils as experiment_utils
-from experiments.utils import _update_config_with_dataset
+from experiments.run_experiments import _generate_dataset_and_update_config
 
 from cem.data.synthetic_loaders import (
     get_synthetic_data_loader, get_synthetic_num_features
 )
 from cem.data.utils import LambdaDataset, transform_from_config
-from cem.models.construction import construct_model
-
+from cem.models.construction import construct_model, load_trained_model
 
 
 ################################################################################
@@ -270,126 +269,23 @@ def _multiprocess_run_trial(
     )
     experiment_utils.evaluate_expressions(config)
 
-    # # Get the appropiate training function
-    # if config["architecture"] == \
-    #         "IndependentConceptBottleneckModel":
-    #     # Special case for now for independent CBMs
-    #     # config["architecture"] = "ConceptBottleneckModel"
-    #     config["sigmoidal_prob"] = True
-    #     train_fn = training.train_independent_model
-    # elif config["architecture"] == \
-    #         "SequentialConceptBottleneckModel":
-    #     # Special case for now for sequential CBMs
-    #     # config["architecture"] = "ConceptBottleneckModel"
-    #     config["sigmoidal_prob"] = True
-    #     train_fn = training.train_sequential_model
-    # elif config["architecture"] in [
-    #     "ProbCBM",
-    #     "ProbabilisticCBM",
-    #     "ProbabilisticConceptBottleneckModel",
-    # ]:
-    #     train_fn = train_prob_cbm.train_prob_cbm
+    model = load_trained_model(
+        config=config,
+        n_tasks=config['n_tasks'],
+        n_concepts=config['n_concepts'],
+        result_dir=result_dir,
+        split=split,
+        imbalance=imbalance,
+        task_class_weights=task_class_weights,
+        intervene=True,
+    )
 
-    # elif config['architecture'] in [
-    #     'GlanceNet',
-    # ]:
-    #     train_fn = train_glancenet.train_glancenet
-
-    # elif config['architecture'] in [
-    #     'MixtureOfConceptEmbeddingsModel',
-    #     'MixCEM',
-    #     'MCIntCEM', # Legacy
-    # ]:
-    #     train_fn = train_mixcem.train_mixcem
-
-    # elif config["architecture"] in [
-    #     "PosthocCBM",
-    #     "PCBM",
-    #     "PosthocConceptBottleneckModel",
-    #     "Post-hocConceptBottleneckModel",
-    # ]:
-    #     train_fn = train_pcbm.train_pcbm
-
-    # elif config["architecture"] in [
-    #     "FixedEmbConceptEmbeddingModel",
-    #     "FixedConceptEmbeddingModel",
-    #     "FixedCEM",
-    # ]:
-    #     train_fn = train_fixed_cem.train_fixed_cem
-
-    # elif config["architecture"] in [
-    #     "BBModel",
-    #     "BlackBoxModel",
-    #     "BlackBox",
-    # ]:
-    #     train_fn = train_blackbox.train_blackbox
-    # else:
-    #     train_fn = training.train_end_to_end_model
-
-    # Train the model and get testing and validation results
-    # model, model_results = train_fn(
-    #     run_name=run_name,
-    #     task_class_weights=task_class_weights,
-    #     accelerator=accelerator,
-    #     devices=devices,
-    #     n_concepts=config['n_concepts'],
-    #     n_tasks=config['n_tasks'],
-    #     input_shape=config['input_shape'],
-    #     config=config,
-    #     train_dl=train_dl,
-    #     val_dl=val_dl,
-    #     split=split,
-    #     result_dir=result_dir,
-    #     rerun=current_rerun,
-    #     project_name=project_name,
-    #     seed=(42 + split),
-    #     imbalance=imbalance,
-    #     old_results=old_results,
-    #     gradient_clip_val=config.get(
-    #         'gradient_clip_val',
-    #         0,
-    #     ),
-    # )
-    # update_statistics(
-    #     aggregate_results=trial_results,
-    #     test_results=model_results,
-    # )
     test_datasets = [
         (val_dl, "val"),
         (test_dl, "test"),
     ]
-    # # Change the model to eval mode
-    # was_training = model.training
-    path = "results/celeba_china/CEM_fold_1.pt"
-    ckpt = torch.load(path, map_location="cpu")
-
-    if isinstance(ckpt, dict):
-        print("keys:", list(ckpt.keys())[:20])
-
-    # Common cases:
-    # 1) Lightning checkpoint -> contains 'state_dict' and Lightning metadata
-    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-
-        state = ckpt['state_dict']
-
-    # 2) plain state_dict saved with torch.save(model.state_dict())
-    elif isinstance(ckpt, dict) and all(k.startswith('module.') or '.' in k for k in ckpt.keys()):
-        state = ckpt
-    else:
-        raise ValueError("Unrecognized checkpoint format")
-
-    n_concepts=config['n_concepts']
-    n_tasks=config['n_tasks']
-
-    model = construct_model(
-        n_concepts,
-        n_tasks,
-        config,
-        imbalance=imbalance,
-        task_class_weights=task_class_weights,
-        train=False,
-    )
-
+    # Change the model to eval mode
+    was_training = model.training
     model.eval()
     # Add the no grad guard to save memory and speed things up
     with torch.no_grad():
@@ -408,8 +304,8 @@ def _multiprocess_run_trial(
             accelerator=accelerator,
             devices=devices,
             split=split,
-            rerun=True,                         # True
-            old_results=None,                   #
+            rerun=current_rerun,
+            old_results=old_results,
         )
         update_statistics(
             aggregate_results=trial_results,

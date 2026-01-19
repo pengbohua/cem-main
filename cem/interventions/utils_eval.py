@@ -347,6 +347,7 @@ def intervene_in_cbm(
     use_auc=False,
     fast_intervention=False,
     use_sample_competence=False,
+    ignore_class_idx=1000
 ):
 
     run_name = run_name or config.get('run_name', config['architecture'])
@@ -561,7 +562,9 @@ def intervene_in_cbm(
             axis=0,
         )
         if (not use_auc) and (n_tasks > 1):
-            acc = np.mean(y_pred == y_test.detach().cpu().numpy())
+            y_test_np = y_test.detach().cpu().numpy()
+            mask = y_test_np == ignore_class_idx
+            acc = np.mean((y_pred == y_test_np)[~mask])
             logging.debug(
                 f"\tAccuracy when intervening "
                 f"with {num_groups_intervened} "

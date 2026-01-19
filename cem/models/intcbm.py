@@ -1164,7 +1164,7 @@ class IntAwareConceptEmbeddingModel(
         )
         self.rollout_init_steps = rollout_init_steps
         self.intervention_weight = intervention_weight
-        self.loss_interventions = torch.nn.CrossEntropyLoss(ignore_index=1000)
+        self.loss_interventions = torch.nn.CrossEntropyLoss()
         self.max_horizon = max_horizon
         self.include_only_last_trajectory_loss = \
             include_only_last_trajectory_loss

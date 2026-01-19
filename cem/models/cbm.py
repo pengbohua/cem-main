@@ -1,5 +1,6 @@
 import sklearn.metrics
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchvision.models import resnet50
 import numpy as np
@@ -10,6 +11,23 @@ from cem.metrics.accs import compute_accuracy
 ################################################################################
 ## BASELINE MODEL
 ################################################################################
+
+
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0.0
+        self.avg = 0.0
+        self.sum = 0.0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / max(self.count, 1)
 
 
 class ConceptBottleneckModel(pl.LightningModule):
@@ -40,13 +58,14 @@ class ConceptBottleneckModel(pl.LightningModule):
         lr_scheduler_patience=10,
         weight_loss=None,
         task_class_weights=None,
-
+        sample_c_preds=True,
+        beta_max=10,
         active_intervention_values=None,
         inactive_intervention_values=None,
         intervention_policy=None,
         output_interventions=False,
         use_concept_groups=False,
-
+        kl_ratio=0.1,
         top_k_accuracy=None,
     ):
         """
@@ -174,6 +193,13 @@ class ConceptBottleneckModel(pl.LightningModule):
                 if i != len(units) - 1:
                     layers.append(torch.nn.LeakyReLU())
             self.c2y_model = torch.nn.Sequential(*layers)
+
+        # Quantum-style amortized prior parameters
+        latent_dim = n_concepts + extra_dims
+        self.linear_prior_a = torch.nn.Linear(latent_dim, n_concepts)
+        self.linear_prior_b = torch.nn.Linear(latent_dim, n_concepts)
+        self.sample_c_preds = sample_c_preds
+        self.beta_max = beta_max
         # Intervention-specific fields/handlers:
         if active_intervention_values is not None:
             self.active_intervention_values = torch.FloatTensor(
@@ -217,15 +243,21 @@ class ConceptBottleneckModel(pl.LightningModule):
         elif (bottleneck_nonlinear is None) or (
             bottleneck_nonlinear == "identity"
         ):
-            self.bottleneck_nonlin = torch.nn.Identity()
+            self.bottleneck_nonlin = lambda x: x
         else:
             raise ValueError(
                 f"Unsupported nonlinearity '{bottleneck_nonlinear}'"
             )
 
+        # Buffers and stats for quantum-style posterior tracking
+        self.register_buffer("N1", torch.zeros(self.n_concepts))
+        self.register_buffer("N0", torch.zeros(self.n_concepts))
+        self.register_buffer("val_count", torch.tensor(0.0))
+        self.ema = 0.9
+
         self.loss_concept = torch.nn.BCELoss(weight=weight_loss)
         self.loss_task = (
-            torch.nn.CrossEntropyLoss(weight=task_class_weights, ignore_index=1000,)
+            torch.nn.CrossEntropyLoss(weight=task_class_weights, ignore_index=1000)
             if n_tasks > 1 else torch.nn.BCEWithLogitsLoss(
                 pos_weight=task_class_weights
             )
@@ -236,6 +268,7 @@ class ConceptBottleneckModel(pl.LightningModule):
         self.momentum = momentum
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.kl_ratio = kl_ratio
         self.optimizer_name = optimizer
         self.extra_dims = extra_dims
         self.top_k_accuracy = top_k_accuracy
@@ -243,6 +276,7 @@ class ConceptBottleneckModel(pl.LightningModule):
         self.sigmoidal_prob = sigmoidal_prob
         self.sigmoidal_extra_capacity = sigmoidal_extra_capacity
         self.use_concept_groups = use_concept_groups
+        self._init_meters()
 
     def _unpack_batch(self, batch):
         x = batch[0]
@@ -334,6 +368,127 @@ class ConceptBottleneckModel(pl.LightningModule):
             intervention_idxs = torch.BoolTensor(intervention_idxs)
         intervention_idxs = intervention_idxs.to(dtype=torch.bool)
         return intervention_idxs
+
+    def _compute_beta_params(self, latent):
+        beta_a = F.softplus(self.linear_prior_a(latent)) + 1e-6
+        beta_b = F.softplus(self.linear_prior_b(latent)) + 1e-6
+        beta_a = beta_a.clamp(max=self.beta_max)
+        beta_b = beta_b.clamp(max=self.beta_max)
+        return beta_a, beta_b
+
+    def _compute_logging_stats(
+        self,
+        beta_a,
+        beta_b,
+        c_pred,
+        y,
+        task_loss,
+        kl_loss,
+        meters,
+        use_precise_posterior=False,
+    ):
+        """
+        beta_a, beta_b: (B, K)
+        c_pred: (B, K)
+        y: (B,)
+        meters: dict of AverageMeter
+        """
+        B, K = c_pred.shape
+
+        # ---------- 1. prior / posterior mean ----------
+        a = beta_a.mean(dim=0)  # K
+        b = beta_b.mean(dim=0)  # K
+        prior_mean = (a / (a + b)).mean().item()
+
+        if use_precise_posterior:
+            post_mean = ((a + self.N1) / (a + b + self.N1 + self.N0)).mean().item()
+        else:
+            # batch posterior
+            m = (c_pred >= 0.5).float()
+            N1 = m.sum(dim=0)
+            N0 = B - N1
+            post_mean = ((a + N1) / (a + b + N1 + N0)).mean().item()
+
+        # ---------- 2. E[m] ----------
+        Em = (c_pred >= 0.5).float().mean().item()
+
+        # ---------- 3. Beta parameter expectations ----------
+        Ea = a.mean().item()
+        Eb = b.mean().item()
+        Ea_over_b = (a / (b + 1e-6)).mean().item()
+
+        # ---------- 4. batch diversity (DivBetaPrior proxy) ----------
+        c_norm = F.normalize(c_pred, dim=-1)  # B, K
+        mask = torch.eye(K, device=c_pred.device)
+        sim = torch.matmul(c_norm.T, c_norm) * (1 - mask)  # K, K
+        diversity = (1 - sim.mean()).item()
+
+        # ---------- 5. <c_i, W[y_i, :]> ----------
+
+        W = self.c2y_model[0].weight  # (n_tasks, K)
+        W_y = W[y]  # y: (B,) -> (B, K)
+        W_y = F.normalize(W_y, dim=1)
+        concept_label_dot = torch.einsum("bk,bk->b", c_norm, W_y
+                                         ).mean().item()  # dot product row by row
+
+        # ---------- update meters ----------
+        meters["prior_mean"].update(prior_mean, B)
+        meters["posterior_mean"].update(post_mean, B)
+        meters["task_loss"].update(task_loss.item(), B)
+        meters["kl"].update(kl_loss.item(), B)
+        meters["Em"].update(Em, B)
+        meters["Ea"].update(Ea, B)
+        meters["Eb"].update(Eb, B)
+        meters["Ea_over_b"].update(Ea_over_b, B)
+        meters["diversity"].update(diversity, B)
+        meters["concept_label_dot"].update(concept_label_dot, B)
+
+    def _init_meters(self):
+        keys = [
+            "prior_mean",
+            "posterior_mean",
+            "task_loss",
+            "kl",
+            "Em",
+            "Ea",
+            "Eb",
+            "Ea_over_b",
+            "diversity",
+            "concept_label_dot",
+        ]
+
+        self.train_meters = {k: AverageMeter() for k in keys}
+        self.val_meters = {k: AverageMeter() for k in keys}
+
+    def beta_kl(self, beta_a, beta_b, c_pred, threshold=0.5):
+        """
+        beta_a, beta_b: prior parameters, shape (B, K) or (K,)
+        c_pred: sampled concept probs, shape (B, K)
+        """
+
+        # --- Bernoulli observations ---
+        m = (c_pred >= threshold).float()  # B, K
+
+        # --- sufficient statistics ---
+        N1 = m.sum(dim=0)  # K
+        N0 = m.size(0) - N1  # K
+
+        # --- aggregate prior (concept-level) ---
+        a = beta_a.mean(dim=0)  # K
+        b = beta_b.mean(dim=0)  # K
+
+        # --- posterior ---
+        post_a = a + N1
+        post_b = b + N0
+
+        q = torch.distributions.Beta(post_a, post_b)
+        p = torch.distributions.Beta(a, b)
+
+        # KL per concept
+        kl = torch.distributions.kl_divergence(q, p)  # K
+
+        # return scalar
+        return kl.mean()
 
     def _extra_losses(
         self,
@@ -440,17 +595,31 @@ class ConceptBottleneckModel(pl.LightningModule):
         )
         if latent is None:
             latent = self.x2c_model(x)
+        beta_a, beta_b = self._compute_beta_params(latent)
+        self._last_beta_a = beta_a
+        self._last_beta_b = beta_b
+
         if self.sigmoidal_prob or self.bool:
             if self.extra_dims:
                 # Then we only sigmoid on the probability bits but
                 # let the other entries up for grabs
-                c_pred_probs = self.sig(latent[:, :-self.extra_dims])
-                c_others = self.bottleneck_nonlin(latent[:,-self.extra_dims:])
+                concept_latent = latent[:, :-self.extra_dims]
+                if self.sample_c_preds:
+                    prior_theta = torch.distributions.Beta(beta_a, beta_b)
+                    c_pred_probs = prior_theta.rsample()
+                else:
+                    c_pred_probs = self.sig(concept_latent)
+                c_others = self.bottleneck_nonlin(latent[:, -self.extra_dims:])
                 c_pred = torch.cat([c_pred_probs, c_others], axis=-1)
                 c_sem = c_pred_probs
             else:
-                c_pred = self.sig(latent)
-                c_sem = c_pred
+                if self.sample_c_preds:
+                    prior_theta = torch.distributions.Beta(beta_a, beta_b)
+                    c_pred = prior_theta.rsample()
+                    c_sem = c_pred
+                else:
+                    c_pred = self.sig(latent)
+                    c_sem = c_pred
         else:
             # Otherwise, the concept vector itself is not sigmoided
             # but the semantics
@@ -459,6 +628,7 @@ class ConceptBottleneckModel(pl.LightningModule):
                 c_sem = self.sig(latent[:, :-self.extra_dims])
             else:
                 c_sem = self.sig(latent)
+
         if output_embeddings or (
             (intervention_idxs is None) and (c is not None) and (
             self.intervention_policy is not None
@@ -523,7 +693,7 @@ class ConceptBottleneckModel(pl.LightningModule):
                 prior_distribution=prior_distribution,
             )
         else:
-            c_int = c
+            c_int = c       # use true concept labels as interventions
         c_pred = self._concept_intervention(
             c_pred=c_pred,
             intervention_idxs=intervention_idxs,
@@ -618,11 +788,11 @@ class ConceptBottleneckModel(pl.LightningModule):
         batch_idx,
         train=False,
         intervention_idxs=None,
+        use_precise_posterior=False,
     ):
         x, y, (c, g, competencies, prev_interventions) = self._unpack_batch(
             batch
         )
-        # print(c.shape)
         outputs = self._forward(
             x,
             intervention_idxs=intervention_idxs,
@@ -633,41 +803,42 @@ class ConceptBottleneckModel(pl.LightningModule):
             prev_interventions=prev_interventions,
         )
         c_sem, c_logits, y_logits = outputs[0], outputs[1], outputs[2]
-        if self.task_loss_weight != 0:
+        beta_a = getattr(self, "_last_beta_a", None)
+        beta_b = getattr(self, "_last_beta_b", None)
+        if (beta_a is None) or (beta_b is None):
+            latent = self.x2c_model(x)
+            beta_a, beta_b = self._compute_beta_params(latent)
+        c_pred_for_kl = (
+            c_logits[:, :self.n_concepts] if self.extra_dims else c_logits
+        )
+        kl_loss = self.beta_kl(beta_a, beta_b, c_pred_for_kl)   # KL divergence
+        if self.task_loss_weight != 0:      # CrossEntropyLoss
             task_loss = self.loss_task(
                 y_logits if y_logits.shape[-1] > 1 else y_logits.reshape(-1),
-                y,
+                y.long(),
             )
             task_loss_scalar = task_loss.detach()
-
+            print("task_loss_scalar =", task_loss_scalar)
         else:
-            task_loss = 0
-            task_loss_scalar = 0
+            task_loss = torch.tensor(0.0, device=y_logits.device)
+            task_loss_scalar = task_loss.item()
+
         if self.concept_loss_weight != 0:
             # We separate this so that we are allowed to
             # use arbitrary activations (i.e., not necessarily in [0, 1])
             # whenever no concept supervision is provided
             # Will only compute the concept loss for concepts whose certainty
-            # values are fully given
-            # print("concept", c_sem) B, 8
-            # c B, 40
-            concept_loss = self.loss_concept(c_sem, c)
+            # values are fully given, c_sem B, 2 (pos_prob, neg_prob) ; c B, 1
+            concept_loss = self.loss_concept(c_sem, c)  # BCELoss
             concept_loss_scalar = concept_loss.detach()
 
-            # print("concept_loss_scalar =", concept_loss_scalar)
-            loss = self.concept_loss_weight * concept_loss + task_loss + \
-                self._extra_losses(
-                    x=x,
-                    y=y,
-                    c=c,
-                    c_sem=c_sem,
-                    c_pred=c_logits,
-                    y_pred=y_logits,
-                    competencies=competencies,
-                    prev_interventions=prev_interventions,
-                )
         else:
-            loss = task_loss + self._extra_losses(
+            concept_loss = torch.tensor(0.0, device=y_logits.device)
+            concept_loss_scalar = concept_loss.item()
+        print("concept_loss_scalar =", concept_loss_scalar)
+        print("kl_scalar =", kl_loss.item())
+        loss = self.concept_loss_weight * concept_loss + task_loss + self.kl_ratio * kl_loss + \
+            self._extra_losses(
                 x=x,
                 y=y,
                 c=c,
@@ -677,17 +848,24 @@ class ConceptBottleneckModel(pl.LightningModule):
                 competencies=competencies,
                 prev_interventions=prev_interventions,
             )
-            concept_loss_scalar = 0.0
+        meters = self.train_meters if train else self.val_meters
+        self._compute_logging_stats(
+            beta_a=beta_a,
+            beta_b=beta_b,
+            c_pred=c_pred_for_kl,
+            y=y,
+            task_loss=task_loss,
+            kl_loss=kl_loss,
+            meters=meters,
+            use_precise_posterior=use_precise_posterior,
+        )
         # compute accuracy
-        # BEFORE loss computation
-
         (c_accuracy, c_auc, c_f1), (y_accuracy, y_auc, y_f1) = compute_accuracy(
             c_sem,
             y_logits,
             c,
             y,
         )
-
         result = {
             "c_accuracy": c_accuracy,
             "c_auc": c_auc,
@@ -697,6 +875,7 @@ class ConceptBottleneckModel(pl.LightningModule):
             "y_f1": y_f1,
             "concept_loss": concept_loss_scalar,
             "task_loss": task_loss_scalar,
+            "kl": kl_loss.detach(),
             "loss": loss.detach(),
             "avg_c_y_acc": (c_accuracy + y_accuracy) / 2,
         }
@@ -761,7 +940,25 @@ class ConceptBottleneckModel(pl.LightningModule):
         }
 
     def validation_step(self, batch, batch_no):
-        _, result = self._run_step(batch, batch_no, train=False)
+        x, y, _ = self._unpack_batch(batch)
+        with torch.no_grad():
+            latent = self.x2c_model(x)
+            beta_a, beta_b = self._compute_beta_params(latent)
+            theta = torch.distributions.Beta(beta_a, beta_b).mean
+            c_pred = theta
+            m = (c_pred >= 0.5).float()
+
+        # EMA update N1 -> E[m]*self.beta_max
+        self.N1 = self.ema * self.N1 + (1 - self.ema) * (m.sum(dim=0)/m.size(0)*self.beta_max)
+        self.N0 = self.ema * self.N0 + (1 - self.ema) * ((m.size(0) - m.sum(dim=0))/m.size(0)*self.beta_max)
+
+        _, result = self._run_step(
+            batch,
+            batch_no,
+            train=False,
+            use_precise_posterior=True,
+        )
+        self.log("val/loss", result.get("loss", 0), prog_bar=True)
         for name, val in result.items():
             if self.n_tasks <= 2:
                 prog_bar = (("auc" in name))
@@ -788,18 +985,12 @@ class ConceptBottleneckModel(pl.LightningModule):
                 weight_decay=self.weight_decay,
             )
         else:
-            trainable_params = []
-            for p in self.parameters():
-                if p.requires_grad:
-                    trainable_params.append(p)
-
             optimizer = torch.optim.SGD(
-                trainable_params,
+                filter(lambda p: p.requires_grad, self.parameters()),
                 lr=self.learning_rate,
                 momentum=self.momentum,
                 weight_decay=self.weight_decay,
             )
-
         if self.lr_scheduler_patience != 0:
             lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,

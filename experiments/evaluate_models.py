@@ -2,7 +2,7 @@ import numpy as np
 import pytorch_lightning as pl
 import re
 
-import cem.interventions.utils as intervention_utils
+import cem.interventions.utils_eval as intervention_utils
 import cem.train.evaluate as evaluate
 
 

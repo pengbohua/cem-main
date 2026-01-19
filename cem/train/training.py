@@ -7,7 +7,7 @@ import time
 import torch
 
 from pytorch_lightning import seed_everything
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, Callback
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 
@@ -20,9 +20,77 @@ from cem.models.construction import (
 )
 import cem.train.evaluate as evaluate
 
+
+class MetersLoggingCallback(Callback):
+    def __init__(self, result_dir, run_name):
+        super().__init__()
+        self.result_dir = result_dir
+        self.run_name = run_name
+        self.train_history = []
+        self.val_history = []
+
+    def _get_wandb_logger(self, trainer):
+        logger = getattr(trainer, "logger", None)
+        if isinstance(logger, WandbLogger):
+            return logger
+        loggers = getattr(trainer, "loggers", None)
+        if loggers:
+            for item in loggers:
+                if isinstance(item, WandbLogger):
+                    return item
+        return None
+
+    def _extract_meter_avgs(self, meters):
+        return {k: getattr(v, "avg", None) for k, v in meters.items()}
+
+    def _save_history(self, kind, history):
+        if not self.result_dir:
+            return
+        os.makedirs(self.result_dir, exist_ok=True)
+        file_path = os.path.join(
+            self.result_dir,
+            f"{self.run_name}_{kind}_meters_avg.npy",
+        )
+        np.save(file_path, np.array(history, dtype=object))
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        meters = getattr(pl_module, "train_meters", None)
+        if not meters:
+            return
+        epoch = trainer.current_epoch
+        avgs = self._extract_meter_avgs(meters)
+        record = {"epoch": epoch, **avgs}
+        wandb_logger = self._get_wandb_logger(trainer)
+        if wandb_logger is not None:
+            wandb_logger.log_metrics(
+                {"epoch": epoch, **{f"train/{k}": v for k, v in avgs.items()}},
+                step=epoch,
+            )
+        else:
+            self.train_history.append(record)
+            self._save_history("train", self.train_history)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        meters = getattr(pl_module, "val_meters", None)
+        if not meters:
+            return
+        epoch = trainer.current_epoch
+        avgs = self._extract_meter_avgs(meters)
+        record = {"epoch": epoch, **avgs}
+        wandb_logger = self._get_wandb_logger(trainer)
+        if wandb_logger is not None:
+            wandb_logger.log_metrics(
+                {"epoch": epoch, **{f"val/{k}": v for k, v in avgs.items()}},
+                step=epoch,
+            )
+        else:
+            self.val_history.append(record)
+            self._save_history("val", self.val_history)
+
 def _make_callbacks(config, result_dir, full_run_name):
     callbacks = []
     ckpt_callback = None
+    callbacks.append(MetersLoggingCallback(result_dir, full_run_name))
     if config.get('early_stopping_monitor', None) is not None:
         callbacks.append(
             EarlyStopping(

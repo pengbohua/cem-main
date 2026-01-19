@@ -326,16 +326,16 @@ val_dl = ...
 #####
 
 mixcem_model = MixCEM(
-  n_concepts=n_concepts, # Number of training-time concepts
-  n_tasks=n_tasks, # Number of output labels
-  emb_size=16,
-  concept_loss_weight=1,
-  learning_rate=1e-3,
-  optimizer="sgd",
-  c_extractor_arch=latent_code_generator_model, # Replace this appropriately
-  training_intervention_prob=0.25, # RandInt probability
-  ood_dropout_prob=0.5, # Probability we will drop the dynamic component of each embedding during training
-  all_intervened_loss_weight=1,  # Weight for the prior error term
+    n_concepts=n_concepts,  # Number of training-time concepts
+    n_tasks=n_tasks,  # Number of output labels
+    emb_size=16,
+    concept_loss_weight=1,
+    learning_rate=1e-3,
+    optimizer="sgd",
+    c_extractor_arch=latent_code_generator_model,  # Replace this appropriately
+    training_intervention_prob=0.25,  # RandInt probability
+    ood_dropout_prob=0.5,  # Probability we will drop the dynamic component of each embedding during training
+    all_intervened_loss_weight=1,  # Weight for the prior error term
 )
 
 #####
@@ -347,10 +347,10 @@ mixcem_model, train_eval_results = train_mixcem(
     n_tasks=n_tasks,
     config=dict(
         max_epochs=100,  # Number of epochs for training the overall MixCEM model
-        calibration_epochs=30, # Number of epochs to use for Platt scaling
+        calibration_epochs=30,  # Number of epochs to use for Platt scaling
     ),
     train_dl=train_dl,
-    val_dl=val_dl, # Could be the train_dl if no validation set if avaliable
+    val_dl=val_dl,  # Could be the train_dl if no validation set if avaliable
 )
 ```
 

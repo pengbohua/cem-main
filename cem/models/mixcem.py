@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from torchvision.models import resnet50
 
@@ -202,9 +203,31 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             requires_grad=False,
         )
 
+        # MixCEM uses a Beta distribution for each concept probability.
+        # We therefore need TWO generators per concept: one for beta_a and one
+        # for beta_b. We keep the shared/non-shared behavior consistent with
+        # `shared_prob_gen`.
+        beta_in_features = 2 * self.emb_size
+        self.concept_beta_generators = torch.nn.ModuleList()
+        if self.shared_prob_gen:
+            self.concept_beta_generators.append(
+                torch.nn.ModuleList([
+                    torch.nn.Linear(beta_in_features, 1),
+                    torch.nn.Linear(beta_in_features, 1),
+                ])
+            )
+        else:
+            for _ in range(self.n_concepts):
+                self.concept_beta_generators.append(
+                    torch.nn.ModuleList([
+                        torch.nn.Linear(beta_in_features, 1),
+                        torch.nn.Linear(beta_in_features, 1),
+                    ])
+                )
+
     def _uncertainty_based_context_addition(self, concept_probs, temperature=1):
-        # We only select to add a context when the uncertainty is far
-        # from the extremes
+        # We only select to add a context when the uncertainty is far from the extremes 
+        # 当不确定性大（信息量小）的时候，用context（residual）来补充概念表示
         entr = (
             -concept_probs * torch.log2(concept_probs + 1e-6) -
             (1 - concept_probs) * torch.log2(1 - concept_probs + 1e-6)
@@ -374,17 +397,17 @@ class MixCEM(IntAwareConceptEmbeddingModel):
     ):
         extra_outputs = {}
         if latent is None:
-            pre_c = self.pre_concept_model(x)
-            global_emb_center = self.global_concept_context_generators(pre_c)
-            dynamic_contexts = []
-            for concept_idx in range(self.n_concepts):
+            pre_c = self.pre_concept_model(x)   # B, 128
+            global_emb_center = self.global_concept_context_generators(pre_c)   # B, 128 _generate_dynamic_context
+            dynamic_contexts = []   
+            for concept_idx in range(self.n_concepts): # 从image_features生成每个concept的dynamic context
                 dynamic_context = self._generate_dynamic_concept(
                     pre_c,
                     concept_idx=concept_idx,
-                )
+                ) 
                 dynamic_contexts.append(torch.unsqueeze(dynamic_context, dim=1))
-            dynamic_contexts = torch.cat(dynamic_contexts, axis=1)
-            self._dynamic_context = dynamic_contexts
+            dynamic_contexts = torch.cat(dynamic_contexts, axis=1) # B, num_concepts, latent_dim * 2
+            self._dynamic_context = dynamic_contexts      
 
             global_context_pos = \
                 self.concept_embeddings[:, 0, :].unsqueeze(0).expand(
@@ -401,7 +424,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             global_contexts = torch.concat(
                 [global_context_pos, global_context_neg],
                 dim=-1,
-            )
+            ) # B, num_concepts, latent_dim * 2
             latent = dynamic_contexts, global_contexts
         else:
             dynamic_contexts, global_contexts = latent
@@ -411,29 +434,51 @@ class MixCEM(IntAwareConceptEmbeddingModel):
 
         for concept_idx in range(self.n_concepts):
             if self.shared_prob_gen:
-                prob_gen = self.concept_prob_generators[0]
+                beta_a_gen = self.concept_beta_generators[0][0]
+                beta_b_gen = self.concept_beta_generators[0][1]
             else:
-                prob_gen = self.concept_prob_generators[concept_idx]
+                beta_a_gen = self.concept_beta_generators[concept_idx][0]
+                beta_b_gen = self.concept_beta_generators[concept_idx][1]
             if self.hard_selection_value is None:
-                dyn_logits = prob_gen(
+                beta_a = beta_a_gen(
                     global_contexts[:, concept_idx, :] +
                     dynamic_contexts[:, concept_idx, :]
-                )
+                )   # B, latent_dim * 2 -> B, 1
+                beta_b = beta_b_gen(
+                    global_contexts[:, concept_idx, :] +
+                    dynamic_contexts[:, concept_idx, :]
+                )   
             else:
-                # Else we adjust the contextual embeddings here directly
-                dyn_logits = prob_gen(
+                # 固定比例缩放dynamic，（global + (1-hard)dynamic）
+                beta_a = beta_a_gen(
                     global_contexts[:, concept_idx, :] +
                     (
                         (1 - self.hard_selection_value) *
                         dynamic_contexts[:, concept_idx, :]
                     )
                 )
-            prob = self.sig(
-                self._concept_platt_scaling(dyn_logits, concept_idx)
-            )
+                beta_b = beta_b_gen(
+                    global_contexts[:, concept_idx, :] +
+                    (
+                        (1 - self.hard_selection_value) *
+                        dynamic_contexts[:, concept_idx, :]
+                    )
+                )
+
+            # Beta distribution requires strictly positive concentration params.
+            beta_a = F.softplus(beta_a) + 1e-4
+            beta_b = F.softplus(beta_b) + 1e-4
+            beta_a = torch.clamp(beta_a, max=10)
+            beta_b = torch.clamp(beta_b, max=10)
+            prior_theta = torch.distributions.Beta(beta_a, beta_b)
+            prob = prior_theta.rsample()
             c_sem.append(prob)
 
         c_sem = torch.cat(c_sem, axis=-1)
+        # Sanity check + clamp for downstream entropy computations.
+        if not torch.isfinite(c_sem).all():
+            raise ValueError("Non-finite values found in c_sem (concept probabilities).")
+        c_sem = torch.clamp(c_sem, min=1e-6, max=1 - 1e-6)
         self._context_scale_factors = self._uncertainty_based_context_addition(
             concept_probs=c_sem,
             temperature=self.temperature,
@@ -478,7 +523,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                     c.shape[0],
                     -1,
                     -1,
-                )
+                )   # self.concept_embeddings [num_concepts, 2, latent_dim] -> global_context_pos [B, num_concepts, latent_dim]
             global_context_neg = \
                 self.concept_embeddings[:, 1, :].unsqueeze(0).expand(
                     c.shape[0],
@@ -491,7 +536,8 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                         1 - torch.unsqueeze(c, dim=-1)
                     )
                 )
-            )
+            ) # mix 正负融合 global_context_pos [B, num_concepts, latent_dim] 
+            # compute task loss
             new_y_logits = \
                 self.logit_temperatures[0, 0] * self.c2y_model(new_bottleneck)
             loss += self.all_intervened_loss_weight * self.loss_task(
@@ -502,6 +548,88 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                 y,
             )
         return loss
+
+
+    def validation_step(self, batch, batch_no):
+        x, y, _ = self._unpack_batch(batch)
+        with torch.no_grad():
+            pre_c = self.pre_concept_model(x)
+            dynamic_contexts = []
+            for concept_idx in range(self.n_concepts):
+                dynamic_context = self._generate_dynamic_concept(
+                    pre_c,
+                    concept_idx=concept_idx,
+                )
+                dynamic_contexts.append(torch.unsqueeze(dynamic_context, dim=1))
+            dynamic_contexts = torch.cat(dynamic_contexts, axis=1)
+
+            global_context_pos = self.concept_embeddings[:, 0, :].unsqueeze(0).expand(
+                pre_c.shape[0],
+                -1,
+                -1,
+            )
+            global_context_neg = self.concept_embeddings[:, 1, :].unsqueeze(0).expand(
+                pre_c.shape[0],
+                -1,
+                -1,
+            )
+            global_contexts = torch.concat(
+                [global_context_pos, global_context_neg],
+                dim=-1,
+            )
+
+            theta_vals = []
+            for concept_idx in range(self.n_concepts):
+                if self.shared_prob_gen:
+                    beta_a_gen = self.concept_beta_generators[0][0]
+                    beta_b_gen = self.concept_beta_generators[0][1]
+                else:
+                    beta_a_gen = self.concept_beta_generators[concept_idx][0]
+                    beta_b_gen = self.concept_beta_generators[concept_idx][1]
+
+                if self.hard_selection_value is None:
+                    beta_inputs = (
+                        global_contexts[:, concept_idx, :] +
+                        dynamic_contexts[:, concept_idx, :]
+                    )
+                else:
+                    beta_inputs = (
+                        global_contexts[:, concept_idx, :] +
+                        (1 - self.hard_selection_value) *
+                        dynamic_contexts[:, concept_idx, :]
+                    )
+
+                beta_a = F.softplus(beta_a_gen(beta_inputs)) + 1e-4
+                beta_b = F.softplus(beta_b_gen(beta_inputs)) + 1e-4
+                beta_a = torch.clamp(beta_a, max=10)
+                beta_b = torch.clamp(beta_b, max=10)
+                theta = beta_a / (beta_a + beta_b)
+                theta_vals.append(theta.reshape(-1, 1))
+
+            c_pred = torch.cat(theta_vals, dim=-1)
+            m = (c_pred >= 0.5).float()
+
+        # Lazily initialize EMA buffers if our parent init didn't.
+        if not hasattr(self, "N1"):
+            self.register_buffer("N1", torch.zeros(self.n_concepts, device=m.device))
+        if not hasattr(self, "N0"):
+            self.register_buffer("N0", torch.zeros(self.n_concepts, device=m.device))
+        if not hasattr(self, "ema"):
+            self.ema = 0.9
+
+        # EMA update
+        self.N1 = self.ema * self.N1 + (1 - self.ema) * m.sum(dim=0)
+        self.N0 = self.ema * self.N0 + (1 - self.ema) * (m.size(0) - m.sum(dim=0))
+
+        _, result = self._run_step(batch, batch_no, train=False)
+        self.log("val/loss", result.get("loss", 0), prog_bar=True)
+        for name, val in result.items():
+            if self.n_tasks <= 2:
+                prog_bar = (("auc" in name))
+            else:
+                prog_bar = (("c_auc" in name) or ("y_accuracy" in name))
+            self.log("val_" + name, val, prog_bar=prog_bar)
+        return {"val_" + key: val for key, val in result.items()}
 
 
     def _concept_platt_scaling(self, logits, concept_idx):
