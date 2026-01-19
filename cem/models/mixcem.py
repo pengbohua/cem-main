@@ -44,7 +44,8 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             output_interventions=False,
 
             top_k_accuracy=None,
-
+            sample_c_preds=True,
+            beta_max=10,
             # Experimental/debugging arguments
             intervention_discount=1,
             include_only_last_trajectory_loss=True,
@@ -59,7 +60,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             initial_concept_embeddings=None,
             fixed_embeddings=False,
             temperature=1,
-
+            kl_ratio=0.1,
             # Monte carlo stuff
             montecarlo_test_tries=50,  # Number of MC trials to use during inference
             deterministic=False,
@@ -97,7 +98,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         self.deterministic = deterministic
         self.ood_dropout_prob = ood_dropout_prob
         self.output_uncertainty = output_uncertainty
-
+        self.kl_ratio = kl_ratio
         self._mixed_stds = None
 
         super(MixCEM, self).__init__(
@@ -142,6 +143,12 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             bottleneck_size=bottleneck_size,
         )
 
+        if not hasattr(self, "N1"):
+            self.register_buffer("N1", torch.zeros(self.n_concepts, device='cuda'))
+        if not hasattr(self, "N0"):
+            self.register_buffer("N0", torch.zeros(self.n_concepts, device='cuda'))
+        if not hasattr(self, "ema"):
+            self.ema = 0.9
         # Let's generate the global embeddings we will use
         if (initial_concept_embeddings is False) or (
                 initial_concept_embeddings is None
@@ -225,6 +232,8 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                         torch.nn.Linear(beta_in_features, 1),
                     ])
                 )
+        self.sample_c_preds = sample_c_preds
+        self.beta_max = beta_max
 
     def _uncertainty_based_context_addition(self, concept_probs, temperature=1):
         # We only select to add a context when the uncertainty is far from the extremes
@@ -429,7 +438,8 @@ class MixCEM(IntAwareConceptEmbeddingModel):
 
         # Now we can compute all the probabilites!
         c_sem = []
-
+        beta_a_vals = []
+        beta_b_vals = []
         for concept_idx in range(self.n_concepts):
             if self.shared_prob_gen:
                 beta_a_gen = self.concept_beta_generators[0][0]
@@ -466,11 +476,19 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             # Beta distribution requires strictly positive concentration params.
             beta_a = F.softplus(beta_a) + 1e-4
             beta_b = F.softplus(beta_b) + 1e-4
-            beta_a = torch.clamp(beta_a, max=10)
-            beta_b = torch.clamp(beta_b, max=10)
+            beta_a = torch.clamp(beta_a, max=self.beta_max)
+            beta_b = torch.clamp(beta_b, max=self.beta_max)
+            beta_a_vals.append(beta_a)
+            beta_b_vals.append(beta_b)
             prior_theta = torch.distributions.Beta(beta_a, beta_b)
             prob = prior_theta.rsample()
             c_sem.append(prob)
+
+        # record beta priors and kl divergence
+        beta_a_vals = torch.cat(beta_a_vals, dim=-1)
+        beta_b_vals = torch.cat(beta_b_vals, dim=-1)
+        self._last_beta_a = beta_a_vals
+        self._last_beta_b = beta_b_vals
 
         c_sem = torch.cat(c_sem, axis=-1)
         # Sanity check + clamp for downstream entropy computations.
@@ -596,10 +614,15 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             task_loss = torch.tensor(0.0, device=y_logits.device)
             task_loss_scalar = task_loss.item()
 
+        beta_a = getattr(self, "_last_beta_a", None)
+        beta_b = getattr(self, "_last_beta_b", None)
+        kl_loss = self.beta_kl(beta_a, beta_b, c_sem)   # KL divergence
+
         # Compute total loss with extra losses
         loss = (
                 self.concept_loss_weight * concept_loss +
                 self.task_loss_weight * task_loss +
+                self.kl_ratio * kl_loss +
                 self._extra_losses(
                     x=x,
                     y=y,
@@ -707,21 +730,13 @@ class MixCEM(IntAwareConceptEmbeddingModel):
 
                 beta_a = F.softplus(beta_a_gen(beta_inputs)) + 1e-4
                 beta_b = F.softplus(beta_b_gen(beta_inputs)) + 1e-4
-                beta_a = torch.clamp(beta_a, max=10)
-                beta_b = torch.clamp(beta_b, max=10)
+                beta_a = torch.clamp(beta_a, max=self.beta_max)
+                beta_b = torch.clamp(beta_b, max=self.beta_max)
                 theta = beta_a / (beta_a + beta_b)
                 theta_vals.append(theta.reshape(-1, 1))
 
             c_pred = torch.cat(theta_vals, dim=-1)
             m = (c_pred >= 0.5).float()
-
-        # Lazily initialize EMA buffers if our parent init didn't.
-        if not hasattr(self, "N1"):
-            self.register_buffer("N1", torch.zeros(self.n_concepts, device=m.device))
-        if not hasattr(self, "N0"):
-            self.register_buffer("N0", torch.zeros(self.n_concepts, device=m.device))
-        if not hasattr(self, "ema"):
-            self.ema = 0.9
 
         # EMA update
         self.N1 = self.ema * self.N1 + (1 - self.ema) * m.sum(dim=0)

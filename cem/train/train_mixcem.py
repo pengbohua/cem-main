@@ -340,8 +340,8 @@ def train_mixcem(
                     gradient_clip_val=gradient_clip_val,
                 )
 
-                # Train it on the validation set!
-                if config.get('finetune_with_val', True) and (
+                # Train it on the validation set! True -> platt scaling
+                if config.get('finetune_with_val', False) and (
                     val_dl is not None
                 ):
                     calibration_trainer.fit(model, val_dl, val_dl)
