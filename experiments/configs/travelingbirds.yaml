@@ -8,7 +8,7 @@ shared_params:
   dataset_config:
     dataset: "cub"
     num_workers: 8
-    batch_size: 256
+    batch_size: 128
     traveling_birds: true
     traveling_birds_root_dir: "cem/data/CUB_fixed"
     root_dir: "cem/data/CUB200"
@@ -19,7 +19,7 @@ shared_params:
   intervention_config:
     competence_levels: [1]
     intervention_freq: 1
-    intervention_batch_size: 512
+    intervention_batch_size: 128
     val_intervention_policies:
       - policy: "random"
         group_level: true
@@ -55,7 +55,7 @@ shared_params:
             s_vs_p: 0.5
 
   skip_repr_evaluation: true
-  max_epochs: 150
+  max_epochs: 50
   top_k_accuracy: null
   save_model: true
   patience: 15
@@ -74,7 +74,7 @@ shared_params:
   momentum: 0.9
   sigmoidal_prob: false
   training_intervention_prob: 0
-  num_load_workers: 0
+  num_load_workers: 8
 runs:
   - architecture: "MixCEM"
     run_name: "MixCEM KL"
@@ -99,15 +99,25 @@ runs:
     calibration_epochs: 0
 
   - architecture: "ConceptBottleneckModel"
-    run_name: "Joint Logit CBM"
+    run_name: "Joint Logit CBM Bayes"
     concept_loss_weight: 10
     kl_ratio: 0.01
     beta_max: 10
+    sample_c_preds: true
     embedding_activation: "leakyrelu"
     sigmoidal_extra_capacity: false
 
   - architecture: "ConceptBottleneckModel"
-    run_name: "Joint CBM"
+    run_name: "Joint Logit CBM Det"
+    concept_loss_weight: 10
+    kl_ratio: 0.0
+    beta_max: 10
+    sample_c_preds: false
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint CBM Bayes"
     concept_loss_weight: 10
     kl_ratio: 0.01
     beta_max: 10
@@ -116,17 +126,36 @@ runs:
     embedding_activation: "leakyrelu"
     sigmoidal_extra_capacity: false
 
+
   - architecture: "ConceptBottleneckModel"
-    run_name: "DNN"
+    run_name: "Joint CBM Det"
+    concept_loss_weight: 10
+    kl_ratio: 0.0
+    beta_max: 10
+    sample_c_preds: false
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "DNN Det"
     extra_dims: 0
-    kl_ratio: 0.01
+    kl_ratio: 0.0
+    sample_c_preds: false
     beta_max: 10
     concept_loss_weight: 0
     sigmoidal_prob: true
     embedding_activation: "leakyrelu"
 
-
-
+  - architecture: "ConceptBottleneckModel"
+    run_name: "DNN Det"
+    extra_dims: 0
+    kl_ratio: 0.01
+    sample_c_preds: true
+    beta_max: 10
+    concept_loss_weight: 0
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
 #  - architecture: "ConceptBottleneckModel"
 #    run_name: "DNN"
 #    extra_dims: 200
