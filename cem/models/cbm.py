@@ -59,7 +59,6 @@ class ConceptBottleneckModel(pl.LightningModule):
         weight_loss=None,
         task_class_weights=None,
         sample_c_preds=True,
-        beta_max=10,
         active_intervention_values=None,
         inactive_intervention_values=None,
         intervention_policy=None,
@@ -199,7 +198,6 @@ class ConceptBottleneckModel(pl.LightningModule):
         self.linear_prior_a = torch.nn.Linear(latent_dim, n_concepts)
         self.linear_prior_b = torch.nn.Linear(latent_dim, n_concepts)
         self.sample_c_preds = sample_c_preds
-        self.beta_max = beta_max
         # Intervention-specific fields/handlers:
         if active_intervention_values is not None:
             self.active_intervention_values = torch.FloatTensor(
@@ -300,11 +298,18 @@ class ConceptBottleneckModel(pl.LightningModule):
             prev_interventions = None
         return x, y, (c, g, competencies, prev_interventions)
 
-    def _standardize_indices(self, intervention_idxs, batch_size, device='cuda'):
+    def _standardize_indices(self, intervention_idxs, batch_size, device=None):
+        if device is None:
+            if isinstance(intervention_idxs, torch.Tensor):
+                device = intervention_idxs.device
+            else:
+                device = getattr(self, 'device', torch.device('cpu'))
+
         if getattr(self, 'force_all_interventions', False):
             intervention_idxs = torch.ones(
-                (batch_size, self.n_concepts)
-            ).to(device)
+                (batch_size, self.n_concepts),
+                device=device,
+            )
         if isinstance(intervention_idxs, list):
             intervention_idxs = np.array(intervention_idxs)
         if isinstance(intervention_idxs, np.ndarray):
@@ -372,8 +377,8 @@ class ConceptBottleneckModel(pl.LightningModule):
     def _compute_beta_params(self, latent):
         beta_a = F.softplus(self.linear_prior_a(latent)) + 1e-6
         beta_b = F.softplus(self.linear_prior_b(latent)) + 1e-6
-        beta_a = beta_a.clamp(max=self.beta_max)
-        beta_b = beta_b.clamp(max=self.beta_max)
+        beta_a = beta_a.clamp(max=10)
+        beta_b = beta_b.clamp(max=10)
         return beta_a, beta_b
 
     def _compute_logging_stats(
@@ -831,12 +836,9 @@ class ConceptBottleneckModel(pl.LightningModule):
             # values are fully given, c_sem B, 2 (pos_prob, neg_prob) ; c B, 1
             concept_loss = self.loss_concept(c_sem, c)  # BCELoss
             concept_loss_scalar = concept_loss.detach()
-
         else:
             concept_loss = torch.tensor(0.0, device=y_logits.device)
             concept_loss_scalar = concept_loss.item()
-        print("concept_loss_scalar =", concept_loss_scalar)
-        print("kl_scalar =", kl_loss.item())
         loss = self.concept_loss_weight * concept_loss + task_loss + self.kl_ratio * kl_loss + \
             self._extra_losses(
                 x=x,
@@ -948,9 +950,9 @@ class ConceptBottleneckModel(pl.LightningModule):
             c_pred = theta
             m = (c_pred >= 0.5).float()
 
-        # EMA update N1 -> E[m]*self.beta_max
-        self.N1 = self.ema * self.N1 + (1 - self.ema) * (m.sum(dim=0)/m.size(0)*self.beta_max)
-        self.N0 = self.ema * self.N0 + (1 - self.ema) * ((m.size(0) - m.sum(dim=0))/m.size(0)*self.beta_max)
+        # EMA update
+        self.N1 = self.ema * self.N1 + (1 - self.ema) * m.sum(dim=0)
+        self.N0 = self.ema * self.N0 + (1 - self.ema) * (m.size(0) - m.sum(dim=0))
 
         _, result = self._run_step(
             batch,
