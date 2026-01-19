@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+import sklearn.metrics
 
 from torchvision.models import resnet50
 
@@ -13,76 +14,77 @@ class MixCEM(IntAwareConceptEmbeddingModel):
     Mixture of Concept Embeddings Model (MixCEM) as proposed by
     Espinosa Zarlenga et al. at ICML 2025 (https://arxiv.org/abs/2504.17921).
     """
+
     def __init__(
-        self,
-        n_concepts,
-        n_tasks,
-        emb_size=16,
-        training_intervention_prob=0.25,
-        embedding_activation="leakyrelu",
-        concept_loss_weight=1,
+            self,
+            n_concepts,
+            n_tasks,
+            emb_size=16,
+            training_intervention_prob=0.25,
+            embedding_activation="leakyrelu",
+            concept_loss_weight=1,
 
-        c2y_model=None,
-        c2y_layers=None,
-        c_extractor_arch=utils.wrap_pretrained_model(resnet50),
-        output_latent=False,
+            c2y_model=None,
+            c2y_layers=None,
+            c_extractor_arch=utils.wrap_pretrained_model(resnet50),
+            output_latent=False,
 
-        optimizer="adam",
-        momentum=0.9,
-        learning_rate=0.01,
-        weight_decay=4e-05,
-        lr_scheduler_factor=0.1,
-        lr_scheduler_patience=10,
-        weight_loss=None,
-        task_class_weights=None,
+            optimizer="adam",
+            momentum=0.9,
+            learning_rate=0.01,
+            weight_decay=4e-05,
+            lr_scheduler_factor=0.1,
+            lr_scheduler_patience=10,
+            weight_loss=None,
+            task_class_weights=None,
 
-        active_intervention_values=None,
-        inactive_intervention_values=None,
-        intervention_policy=None,
-        output_interventions=False,
+            active_intervention_values=None,
+            inactive_intervention_values=None,
+            intervention_policy=None,
+            output_interventions=False,
 
-        top_k_accuracy=None,
+            top_k_accuracy=None,
 
-        # Experimental/debugging arguments
-        intervention_discount=1,
-        include_only_last_trajectory_loss=True,
-        task_loss_weight=1,
-        intervention_task_loss_weight=1,
+            # Experimental/debugging arguments
+            intervention_discount=1,
+            include_only_last_trajectory_loss=True,
+            task_loss_weight=1,
+            intervention_task_loss_weight=1,
 
-        ##################################
-        # New MixCEM-specific arguments
-        #################################
-        ood_dropout_prob=0.5, # Probability of random dynamic component drop in training (λ_drop in paper)
-        all_intervened_loss_weight=1, # Strength of prior error (λ_p in paper)
-        initial_concept_embeddings=None,
-        fixed_embeddings=False,
-        temperature=1,
+            ##################################
+            # New MixCEM-specific arguments
+            #################################
+            ood_dropout_prob=0.5,  # Probability of random dynamic component drop in training (λ_drop in paper)
+            all_intervened_loss_weight=1,  # Strength of prior error (λ_p in paper)
+            initial_concept_embeddings=None,
+            fixed_embeddings=False,
+            temperature=1,
 
-        # Monte carlo stuff
-        montecarlo_test_tries=50,  # Number of MC trials to use during inference
-        deterministic=False,
-        montecarlo_train_tries=1,
-        output_uncertainty=False,
-        hard_selection_value=None,
+            # Monte carlo stuff
+            montecarlo_test_tries=50,  # Number of MC trials to use during inference
+            deterministic=False,
+            montecarlo_train_tries=1,
+            output_uncertainty=False,
+            hard_selection_value=None,
 
-        ##################################
-        # IntCEM-specific arguments (use this only for IntMixCEM, that is
-        # MixCEM's intervention-aware version)
-        #################################
+            ##################################
+            # IntCEM-specific arguments (use this only for IntMixCEM, that is
+            # MixCEM's intervention-aware version)
+            #################################
 
-        # Intervention-aware hyperparameters (NO intervention-aware loss
-        # is used by default)
-        intervention_task_discount=1,
-        intervention_weight=0,
-        concept_map=None,
-        use_concept_groups=True,
-        rollout_init_steps=0,
-        int_model_layers=None,
-        int_model_use_bn=False,
-        num_rollouts=1,
-        max_horizon=1,
-        initial_horizon=2,
-        horizon_rate=1,
+            # Intervention-aware hyperparameters (NO intervention-aware loss
+            # is used by default)
+            intervention_task_discount=1,
+            intervention_weight=0,
+            concept_map=None,
+            use_concept_groups=True,
+            rollout_init_steps=0,
+            int_model_layers=None,
+            int_model_use_bn=False,
+            num_rollouts=1,
+            max_horizon=1,
+            initial_horizon=2,
+            horizon_rate=1,
     ):
         self.temperature = temperature
         self._context_scale_factors = None
@@ -142,7 +144,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
 
         # Let's generate the global embeddings we will use
         if (initial_concept_embeddings is False) or (
-            initial_concept_embeddings is None
+                initial_concept_embeddings is None
         ):
             initial_concept_embeddings = torch.normal(
                 torch.zeros(self.n_concepts, 2, emb_size),
@@ -159,15 +161,14 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             requires_grad=(not fixed_embeddings),
         )
 
-
         if c2y_model is None:
             # Else we construct it here directly
             units = [
-                n_concepts * emb_size
-            ] + (c2y_layers or []) + [n_tasks]
+                        n_concepts * emb_size
+                    ] + (c2y_layers or []) + [n_tasks]
             layers = [torch.nn.Flatten(1, -1)]
             for i in range(1, len(units)):
-                layers.append(torch.nn.Linear(units[i-1], units[i]))
+                layers.append(torch.nn.Linear(units[i - 1], units[i]))
                 if i != len(units) - 1:
                     layers.append(torch.nn.LeakyReLU())
             self.c2y_model = torch.nn.Sequential(*layers)
@@ -226,14 +227,13 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                 )
 
     def _uncertainty_based_context_addition(self, concept_probs, temperature=1):
-        # We only select to add a context when the uncertainty is far from the extremes 
+        # We only select to add a context when the uncertainty is far from the extremes
         # 当不确定性大（信息量小）的时候，用context（residual）来补充概念表示
         entr = (
-            -concept_probs * torch.log2(concept_probs + 1e-6) -
-            (1 - concept_probs) * torch.log2(1 - concept_probs + 1e-6)
+                -concept_probs * torch.log2(concept_probs + 1e-6) -
+                (1 - concept_probs) * torch.log2(1 - concept_probs + 1e-6)
         )
         return self.temperature * (1 - entr)
-
 
     def _predict_labels(self, bottleneck, **task_loss_kwargs):
         outputs = []
@@ -256,11 +256,11 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         return outputs
 
     def _construct_c2y_input(
-        self,
-        pos_embeddings,
-        neg_embeddings,
-        probs,
-        **task_loss_kwargs,
+            self,
+            pos_embeddings,
+            neg_embeddings,
+            probs,
+            **task_loss_kwargs,
     ):
         # We will generate several versions of the bottleneck with different
         # masks.Then, downstream in the line with _predict_labels, we will
@@ -283,40 +283,39 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         else:
             n_trials = max(self.montecarlo_train_tries, 0)
 
-
         global_pos_embeddings = pos_embeddings[:, :, :self.emb_size]
         contextual_pos_embeddings = pos_embeddings[:, :, self.emb_size:]
         contextual_pos_embeddings = (
-            contextual_pos_embeddings *
-            self._context_scale_factors.unsqueeze(-1)
+                contextual_pos_embeddings *
+                self._context_scale_factors.unsqueeze(-1)
         )
         global_neg_embeddings = neg_embeddings[:, :, :self.emb_size]
         contextual_neg_embeddings = neg_embeddings[:, :, self.emb_size:]
         contextual_neg_embeddings = (
-            contextual_neg_embeddings *
-            self._context_scale_factors.unsqueeze(-1)
+                contextual_neg_embeddings *
+                self._context_scale_factors.unsqueeze(-1)
         )
         bottlenecks = []
         # The first two elements of the array will always be the contextual
         # mixed embedding followed by just the one using the global embeddings
         combined_pos_embs = global_pos_embeddings + \
-            extra_scale * contextual_pos_embeddings
+                            extra_scale * contextual_pos_embeddings
         combined_neg_embs = global_neg_embeddings + \
-            extra_scale * contextual_neg_embeddings
+                            extra_scale * contextual_neg_embeddings
         new_bottleneck = (
-            combined_pos_embs * torch.unsqueeze(probs, dim=-1) + (
+                combined_pos_embs * torch.unsqueeze(probs, dim=-1) + (
                 combined_neg_embs * (
-                    1 - torch.unsqueeze(probs, dim=-1)
-                )
-            )
+                1 - torch.unsqueeze(probs, dim=-1)
+        )
+        )
         )
         bottlenecks.append(new_bottleneck.unsqueeze(-1))
         new_bottleneck = (
-            global_pos_embeddings * torch.unsqueeze(probs, dim=-1) + (
+                global_pos_embeddings * torch.unsqueeze(probs, dim=-1) + (
                 global_neg_embeddings * (
-                    1 - torch.unsqueeze(probs, dim=-1)
-                )
-            )
+                1 - torch.unsqueeze(probs, dim=-1)
+        )
+        )
         )
         bottlenecks.append(new_bottleneck.unsqueeze(-1))
         for _ in range(n_trials):
@@ -339,17 +338,17 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                     ) * (1 - dropout_prob)
                 ).to(global_pos_embeddings.device)
             combined_pos_embs = global_pos_embeddings + (
-                context_selected * contextual_pos_embeddings
+                    context_selected * contextual_pos_embeddings
             )
             combined_neg_embs = global_neg_embeddings + (
-                context_selected * contextual_neg_embeddings
+                    context_selected * contextual_neg_embeddings
             )
             new_bottleneck = (
-                combined_pos_embs * torch.unsqueeze(probs, dim=-1) + (
+                    combined_pos_embs * torch.unsqueeze(probs, dim=-1) + (
                     combined_neg_embs * (
-                        1 - torch.unsqueeze(probs, dim=-1)
-                    )
-                )
+                    1 - torch.unsqueeze(probs, dim=-1)
+            )
+            )
             )
             bottlenecks.append(new_bottleneck.unsqueeze(-1))
         return torch.concat(bottlenecks, dim=-1)
@@ -367,18 +366,18 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         )
 
     def _new_tail_results(
-        self,
-        x=None,
-        c=None,
-        y=None,
-        c_sem=None,
-        bottleneck=None,
-        y_pred=None,
+            self,
+            x=None,
+            c=None,
+            y=None,
+            c_sem=None,
+            bottleneck=None,
+            y_pred=None,
     ):
         tail_results = []
         if (
-            (self._mixed_stds is not None) and
-            (self.output_uncertainty)
+                (self._mixed_stds is not None) and
+                (self.output_uncertainty)
         ):
             tail_results.append(self._mixed_stds)
             self._mixed_stds = None
@@ -388,26 +387,25 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         context = self.concept_context_generators[concept_idx](pre_c)
         return context
 
-
     def _generate_concept_embeddings(
-        self,
-        x,
-        latent=None,
-        training=False,
+            self,
+            x,
+            latent=None,
+            training=False,
     ):
         extra_outputs = {}
         if latent is None:
-            pre_c = self.pre_concept_model(x)   # B, 128
-            global_emb_center = self.global_concept_context_generators(pre_c)   # B, 128 _generate_dynamic_context
-            dynamic_contexts = []   
-            for concept_idx in range(self.n_concepts): # 从image_features生成每个concept的dynamic context
+            pre_c = self.pre_concept_model(x)  # B, 128
+            global_emb_center = self.global_concept_context_generators(pre_c)  # B, 128 _generate_dynamic_context
+            dynamic_contexts = []
+            for concept_idx in range(self.n_concepts):  # 从image_features生成每个concept的dynamic context
                 dynamic_context = self._generate_dynamic_concept(
                     pre_c,
                     concept_idx=concept_idx,
-                ) 
+                )
                 dynamic_contexts.append(torch.unsqueeze(dynamic_context, dim=1))
-            dynamic_contexts = torch.cat(dynamic_contexts, axis=1) # B, num_concepts, latent_dim * 2
-            self._dynamic_context = dynamic_contexts      
+            dynamic_contexts = torch.cat(dynamic_contexts, axis=1)  # B, num_concepts, latent_dim * 2
+            self._dynamic_context = dynamic_contexts
 
             global_context_pos = \
                 self.concept_embeddings[:, 0, :].unsqueeze(0).expand(
@@ -424,7 +422,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             global_contexts = torch.concat(
                 [global_context_pos, global_context_neg],
                 dim=-1,
-            ) # B, num_concepts, latent_dim * 2
+            )  # B, num_concepts, latent_dim * 2
             latent = dynamic_contexts, global_contexts
         else:
             dynamic_contexts, global_contexts = latent
@@ -443,25 +441,25 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                 beta_a = beta_a_gen(
                     global_contexts[:, concept_idx, :] +
                     dynamic_contexts[:, concept_idx, :]
-                )   # B, latent_dim * 2 -> B, 1
+                )  # B, latent_dim * 2 -> B, 1
                 beta_b = beta_b_gen(
                     global_contexts[:, concept_idx, :] +
                     dynamic_contexts[:, concept_idx, :]
-                )   
+                )
             else:
                 # 固定比例缩放dynamic，（global + (1-hard)dynamic）
                 beta_a = beta_a_gen(
                     global_contexts[:, concept_idx, :] +
                     (
-                        (1 - self.hard_selection_value) *
-                        dynamic_contexts[:, concept_idx, :]
+                            (1 - self.hard_selection_value) *
+                            dynamic_contexts[:, concept_idx, :]
                     )
                 )
                 beta_b = beta_b_gen(
                     global_contexts[:, concept_idx, :] +
                     (
-                        (1 - self.hard_selection_value) *
-                        dynamic_contexts[:, concept_idx, :]
+                            (1 - self.hard_selection_value) *
+                            dynamic_contexts[:, concept_idx, :]
                     )
                 )
 
@@ -506,15 +504,15 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         return c_sem, pos_embeddings, neg_embeddings, extra_outputs
 
     def _extra_losses(
-        self,
-        x,
-        y,
-        c,
-        y_pred,
-        c_sem,
-        c_pred,
-        competencies=None,
-        prev_interventions=None,
+            self,
+            x,
+            y,
+            c,
+            y_pred,
+            c_sem,
+            c_pred,
+            competencies=None,
+            prev_interventions=None,
     ):
         loss = 0.0
         if self.all_intervened_loss_weight != 0:
@@ -523,7 +521,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                     c.shape[0],
                     -1,
                     -1,
-                )   # self.concept_embeddings [num_concepts, 2, latent_dim] -> global_context_pos [B, num_concepts, latent_dim]
+                )  # self.concept_embeddings [num_concepts, 2, latent_dim] -> global_context_pos [B, num_concepts, latent_dim]
             global_context_neg = \
                 self.concept_embeddings[:, 1, :].unsqueeze(0).expand(
                     c.shape[0],
@@ -531,12 +529,12 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                     -1,
                 )
             new_bottleneck = (
-                global_context_pos * torch.unsqueeze(c, dim=-1) + (
+                    global_context_pos * torch.unsqueeze(c, dim=-1) + (
                     global_context_neg * (
-                        1 - torch.unsqueeze(c, dim=-1)
-                    )
-                )
-            ) # mix 正负融合 global_context_pos [B, num_concepts, latent_dim] 
+                    1 - torch.unsqueeze(c, dim=-1)
+            )
+            )
+            )  # mix 正负融合 global_context_pos [B, num_concepts, latent_dim]
             # compute task loss
             new_y_logits = \
                 self.logit_temperatures[0, 0] * self.c2y_model(new_bottleneck)
@@ -549,6 +547,114 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             )
         return loss
 
+    def _run_step(
+            self,
+            batch,
+            batch_idx,
+            train=False,
+            intervention_idxs=None,
+            use_precise_posterior=False,
+    ):
+        """
+        MixCEM-specific implementation of _run_step.
+        Adapted from CBM._run_step to handle MixCEM's concept embeddings and Beta distributions.
+        """
+        x, y, (c, g, competencies, prev_interventions) = self._unpack_batch(batch)
+
+        # Forward pass to get concept predictions and task predictions
+        outputs = self._forward(
+            x,
+            intervention_idxs=intervention_idxs,
+            c=c,
+            y=y,
+            train=train,
+            competencies=competencies,
+            prev_interventions=prev_interventions,
+            output_embeddings=True,
+            output_latent=True,
+        )
+        c_sem = outputs[0]  # Concept probabilities from Beta distribution
+        bottleneck = outputs[1]  # Mixed concept embeddings
+        y_logits = outputs[2]  # Task predictions
+
+        # Compute concept loss
+        if self.concept_loss_weight != 0:
+            concept_loss = self.loss_concept(c_sem, c)  # BCELoss on concept predictions
+            concept_loss_scalar = concept_loss.detach()
+        else:
+            concept_loss = torch.tensor(0.0, device=y_logits.device)
+            concept_loss_scalar = concept_loss.item()
+
+        # Compute task loss
+        if self.task_loss_weight != 0:
+            task_loss = self.loss_task(
+                y_logits if y_logits.shape[-1] > 1 else y_logits.reshape(-1),
+                y.long(),
+            )
+            task_loss_scalar = task_loss.detach()
+        else:
+            task_loss = torch.tensor(0.0, device=y_logits.device)
+            task_loss_scalar = task_loss.item()
+
+        # Compute total loss with extra losses
+        loss = (
+                self.concept_loss_weight * concept_loss +
+                self.task_loss_weight * task_loss +
+                self._extra_losses(
+                    x=x,
+                    y=y,
+                    c=c,
+                    c_sem=c_sem,
+                    c_pred=bottleneck,
+                    y_pred=y_logits,
+                    competencies=competencies,
+                    prev_interventions=prev_interventions,
+                )
+        )
+
+        # Compute accuracy metrics
+        from cem.metrics.accs import compute_accuracy
+        (c_accuracy, c_auc, c_f1), (y_accuracy, y_auc, y_f1) = compute_accuracy(
+            c_sem,
+            y_logits,
+            c,
+            y,
+        )
+
+        result = {
+            "c_accuracy": c_accuracy,
+            "c_auc": c_auc,
+            "c_f1": c_f1,
+            "y_accuracy": y_accuracy,
+            "y_auc": y_auc,
+            "y_f1": y_f1,
+            "concept_loss": concept_loss_scalar,
+            "task_loss": task_loss_scalar,
+            "loss": loss.detach(),
+            "avg_c_y_acc": (c_accuracy + y_accuracy) / 2,
+        }
+
+        # Compute top-k accuracy if specified
+        if self.top_k_accuracy is not None:
+            y_true = y.reshape(-1).cpu().detach()
+            y_pred = y_logits.cpu().detach()
+            labels = list(range(self.n_tasks))
+            if isinstance(self.top_k_accuracy, int):
+                top_k_accuracy = list(range(1, self.top_k_accuracy))
+            else:
+                top_k_accuracy = self.top_k_accuracy
+
+            for top_k_val in top_k_accuracy:
+                if top_k_val:
+                    y_top_k_accuracy = sklearn.metrics.top_k_accuracy_score(
+                        y_true,
+                        y_pred,
+                        k=top_k_val,
+                        labels=labels,
+                    )
+                    result[f'y_top_{top_k_val}_accuracy'] = y_top_k_accuracy
+
+        return loss, result
 
     def validation_step(self, batch, batch_no):
         x, y, _ = self._unpack_batch(batch)
@@ -589,14 +695,14 @@ class MixCEM(IntAwareConceptEmbeddingModel):
 
                 if self.hard_selection_value is None:
                     beta_inputs = (
-                        global_contexts[:, concept_idx, :] +
-                        dynamic_contexts[:, concept_idx, :]
+                            global_contexts[:, concept_idx, :] +
+                            dynamic_contexts[:, concept_idx, :]
                     )
                 else:
                     beta_inputs = (
-                        global_contexts[:, concept_idx, :] +
-                        (1 - self.hard_selection_value) *
-                        dynamic_contexts[:, concept_idx, :]
+                            global_contexts[:, concept_idx, :] +
+                            (1 - self.hard_selection_value) *
+                            dynamic_contexts[:, concept_idx, :]
                     )
 
                 beta_a = F.softplus(beta_a_gen(beta_inputs)) + 1e-4
@@ -631,11 +737,10 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             self.log("val_" + name, val, prog_bar=prog_bar)
         return {"val_" + key: val for key, val in result.items()}
 
-
     def _concept_platt_scaling(self, logits, concept_idx):
         return (
-            self.concept_platt_scales[concept_idx] * logits +
-            self.concept_platt_biases[concept_idx]
+                self.concept_platt_scales[concept_idx] * logits +
+                self.concept_platt_biases[concept_idx]
         )
 
     def freeze_global_components(self):
@@ -653,17 +758,17 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         pass
 
     def unfreeze_calibration_components(
-        self,
-        unfreeze_dynamic=True,
-        unfreeze_global=True,
+            self,
+            unfreeze_dynamic=True,
+            unfreeze_global=True,
     ):
         self.concept_platt_scales.requires_grad = True
         self.concept_platt_biases.requires_grad = True
 
     def freeze_calibration_components(
-        self,
-        freeze_dynamic=True,
-        freeze_global=True,
+            self,
+            freeze_dynamic=True,
+            freeze_global=True,
     ):
         self.concept_platt_scales.requires_grad = False
         self.concept_platt_biases.requires_grad = False

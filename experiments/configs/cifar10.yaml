@@ -200,7 +200,7 @@ runs:
 
   - architecture: "MixCEM"
     run_name: "MixCEM"
-    max_epochs: 150
+    max_epochs: 50
     concept_loss_weight: 1
     training_intervention_prob: 0.25
     load_path_name: "MixCEM_r_0.1_g_ood_0.5_cwl_1_ce_0"
