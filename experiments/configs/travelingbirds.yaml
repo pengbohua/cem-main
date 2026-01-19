@@ -4,7 +4,7 @@ results_dir: results/travelingbirds_complete/
 shared_params:
   results_dir: "results/travelingbirds_complete/"
   trials: 1
-  model_selection_trials: 3
+  model_selection_trials: 1
   dataset_config:
     dataset: "cub"
     num_workers: 8
@@ -28,31 +28,33 @@ shared_params:
       - policy: "random"
         group_level: true
         use_prior: false
-      - policy: "random"
-        group_level: true
-        use_prior: true
-        include_run_names: [".*(IntCEM).*"]
+#      - policy: "random"
+#        group_level: true
+#        use_prior: true
+#        include_run_names: [".*(IntCEM).*"]
   eval_config:
-    additional_metrics:
-      - name: "mixcem_sel"
-        include_list: [".*(MixCEM).*"]
-    additional_test_sets:
-      - name: "OOD_sap_0.1"
-        update_previous: true
-        dataset_config:
-          test_transformation_config:
-            post_generation: false
-            name: "salt_and_pepper"
-            amount: 0.1
-            s_vs_p: 0.5
-      - name: "OOD_sap_0.25"
-        update_previous: true
-        dataset_config:
-          test_transformation_config:
-            post_generation: false
-            name: "salt_and_pepper"
-            amount: 0.25
-            s_vs_p: 0.5
+    additional_metrics: []
+    additional_test_sets: []
+#    additional_metrics:
+#      - name: "mixcem_sel"
+#        include_list: [".*(MixCEM).*"]
+#    additional_test_sets:
+#      - name: "OOD_sap_0.1"
+#        update_previous: true
+#        dataset_config:
+#          test_transformation_config:
+#            post_generation: false
+#            name: "salt_and_pepper"
+#            amount: 0.1
+#            s_vs_p: 0.5
+#      - name: "OOD_sap_0.25"
+#        update_previous: true
+#        dataset_config:
+#          test_transformation_config:
+#            post_generation: false
+#            name: "salt_and_pepper"
+#            amount: 0.25
+#            s_vs_p: 0.5
 
   skip_repr_evaluation: true
   max_epochs: 50
