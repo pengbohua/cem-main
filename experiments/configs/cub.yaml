@@ -1,8 +1,8 @@
 trials: 1
-results_dir: results/cub_complete_mixcem2/
+results_dir: results/cub_complete/
 
 shared_params:
-  results_dir: "results/cub_complete_mixcem2/"
+  results_dir: "results/cub_complete/"
   trials: 1
   model_selection_trials: 1
   dataset_config:
@@ -60,16 +60,17 @@ shared_params:
   emb_size: 16
   extra_dims: 0
   concept_loss_weight: [1, 5, 10]
-  learning_rate: 0.01
-  weight_decay: 4.0e-06
+  learning_rate: 0.02
+  weight_decay: 1e-5
   weight_loss: true
+  warmup_epochs: 5
   c_extractor_arch: "resnet18"
   optimizer: "sgd"
   bool: false
   early_stopping_monitor: "val_loss"
   early_stopping_mode: "min"
   early_stopping_delta: 0.0
-  momentum: 0.9
+  momentum: 0.8
   sigmoidal_prob: false
   training_intervention_prob: 0
   num_load_workers: 8
