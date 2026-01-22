@@ -90,6 +90,7 @@ class MetersLoggingCallback(Callback):
 def _make_callbacks(config, result_dir, full_run_name):
     callbacks = []
     ckpt_callback = None
+    print("meter callback start", result_dir, full_run_name)
     callbacks.append(MetersLoggingCallback(result_dir, full_run_name))
     if config.get('early_stopping_monitor', None) is not None:
         callbacks.append(
@@ -265,7 +266,7 @@ def train_end_to_end_model(
         if (not rerun) and os.path.exists(model_saved_path):
             # Then we simply load the model and proceed
             print("\tFound cached model... loading it")
-            model.load_state_dict(torch.load(model_saved_path))
+            model.load_state_dict(torch.load(model_saved_path), strict=False)
             if os.path.exists(
                 model_saved_path.replace(".pt", "_training_times.npy")
             ):

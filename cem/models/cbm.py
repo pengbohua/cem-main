@@ -30,6 +30,46 @@ class AverageMeter:
         self.avg = self.sum / max(self.count, 1)
 
 
+def batch_diversity(c_repr: torch.Tensor):
+    """Per-concept within-batch correlation and an aggregated scalar.
+
+    For each concept k, compute the mean similarity of each sample to all other
+    samples in the batch (excluding self-pairs), and then average across the
+    batch. This yields a vector `diversity` of shape (K,) where larger values
+    mean higher within-batch correlation (less diverse).
+
+    Shapes:
+        c_repr: (B, K) or (B, K, F)
+
+    Returns:
+        diversity: (K,) mean similarity per concept (higher => more correlated)
+        total_diversity: scalar = 1 - diversity.mean()
+    """
+    if c_repr.dim() == 2:
+        # (B, K)
+        x = c_repr
+        sims = torch.einsum("bk,lk->kbl", x, x)  # (K, B, B)
+    elif c_repr.dim() == 3:
+        # (B, K, F)
+        x = F.normalize(c_repr, dim=-1)
+        sims = torch.einsum("bkf,lkf->kbl", x, x)  # (K, B, B)
+    else:
+        raise ValueError(
+            f"Expected c_repr to have shape (B,K) or (B,K,F) but got {tuple(c_repr.shape)}"
+        )
+
+    K, B, _ = sims.shape
+    if B <= 1:
+        diversity = torch.zeros((K,), device=c_repr.device)
+    else:
+        off_diag = ~torch.eye(B, device=c_repr.device, dtype=torch.bool)
+        sims_off = sims[:, off_diag]  # (K, B*B - B)
+        diversity = sims_off.mean(dim=1)  # (K,)
+
+    total_diversity = 1.0 - diversity.mean()
+    return diversity, total_diversity
+
+
 class ConceptBottleneckModel(pl.LightningModule):
     def __init__(
         self,
@@ -424,11 +464,12 @@ class ConceptBottleneckModel(pl.LightningModule):
         Eb = b.mean().item()
         Ea_over_b = (a / (b + 1e-6)).mean().item()
 
-        # ---------- 4. batch diversity (DivBetaPrior proxy) ----------
-        c_norm = F.normalize(c_pred, dim=-1)  # B, K
-        mask = torch.eye(K, device=c_pred.device)
-        sim = torch.matmul(c_norm.T, c_norm) * (1 - mask)  # K, K
-        diversity = (1 - sim.mean()).item()
+        # ---------- 4. batch diversity ----------
+        diversity, total_diversity = batch_diversity(c_pred)
+
+        # Normalized concepts for downstream dot-products
+        c_norm = F.normalize(c_pred, dim=-1)
+
 
         # ---------- 5. <c_i, W[y_i, :]> ----------
 
@@ -447,7 +488,7 @@ class ConceptBottleneckModel(pl.LightningModule):
         meters["Ea"].update(Ea, B)
         meters["Eb"].update(Eb, B)
         meters["Ea_over_b"].update(Ea_over_b, B)
-        meters["diversity"].update(diversity, B)
+        meters["diversity"].update(float(total_diversity.item()), B)
         meters["concept_label_dot"].update(concept_label_dot, B)
 
     def _init_meters(self):
@@ -818,7 +859,10 @@ class ConceptBottleneckModel(pl.LightningModule):
         c_pred_for_kl = (
             c_logits[:, :self.n_concepts] if self.extra_dims else c_logits
         )
-        kl_loss = self.beta_kl(beta_a, beta_b, c_pred_for_kl)   # KL divergence
+        if self.sample_c_preds:
+            kl_loss = self.beta_kl(beta_a, beta_b, c_pred_for_kl)   # KL divergence
+        else:
+            kl_loss = torch.tensor(0.0, device=y_logits.device)
         if self.task_loss_weight != 0:      # CrossEntropyLoss
             task_loss = self.loss_task(
                 y_logits if y_logits.shape[-1] > 1 else y_logits.reshape(-1),
@@ -944,17 +988,19 @@ class ConceptBottleneckModel(pl.LightningModule):
         }
 
     def validation_step(self, batch, batch_no):
-        x, y, _ = self._unpack_batch(batch)
-        with torch.no_grad():
-            latent = self.x2c_model(x)
-            beta_a, beta_b = self._compute_beta_params(latent)
-            theta = torch.distributions.Beta(beta_a, beta_b).mean
-            c_pred = theta
-            m = (c_pred >= 0.5).float()
+        sample_c_preds = getattr(self, "sample_c_preds", False)
+        if sample_c_preds:
+            x, y, _ = self._unpack_batch(batch)
+            with torch.no_grad():
+                latent = self.x2c_model(x)
+                beta_a, beta_b = self._compute_beta_params(latent)
+                theta = torch.distributions.Beta(beta_a, beta_b).mean
+                c_pred = theta
+                m = (c_pred >= 0.5).float()
 
-        # EMA update N1 -> E[m]*self.beta_max
-        self.N1 = self.ema * self.N1 + (1 - self.ema) * (m.sum(dim=0)/m.size(0)*self.beta_max)
-        self.N0 = self.ema * self.N0 + (1 - self.ema) * ((m.size(0) - m.sum(dim=0))/m.size(0)*self.beta_max)
+            # EMA update N1 -> E[m]*self.beta_max
+            self.N1 = self.ema * self.N1 + (1 - self.ema) * (m.sum(dim=0)/m.size(0)*self.beta_max)
+            self.N0 = self.ema * self.N0 + (1 - self.ema) * ((m.size(0) - m.sum(dim=0))/m.size(0)*self.beta_max)
 
         _, result = self._run_step(
             batch,

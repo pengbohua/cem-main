@@ -900,5 +900,5 @@ def load_trained_model(
             output_interventions=output_interventions,
         )
 
-    model.load_state_dict(torch.load(model_saved_path))
+    model.load_state_dict(torch.load(model_saved_path), strict=False)
     return model

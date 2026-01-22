@@ -1,10 +1,12 @@
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 
 from torchvision.models import resnet50
 
-from cem.models.cbm import ConceptBottleneckModel
+from cem.metrics.accs import compute_accuracy
+from cem.models.cbm import ConceptBottleneckModel, AverageMeter, batch_diversity
 import cem.train.utils as utils
 
 
@@ -229,7 +231,15 @@ class ConceptEmbeddingModel(ConceptBottleneckModel):
         self.n_tasks = n_tasks
         self.emb_size = emb_size
         self.use_concept_groups = use_concept_groups
+        self._init_meters()
 
+    def _init_meters(self):
+        keys = [
+            "diversity",
+            "concept_label_dot",
+        ]
+        self.train_meters = {k: AverageMeter() for k in keys}
+        self.val_meters = {k: AverageMeter() for k in keys}
 
     def _after_interventions(
         self,
@@ -446,6 +456,134 @@ class ConceptEmbeddingModel(ConceptBottleneckModel):
             y_pred=y_pred,
         )
         return tuple([c_sem, bottleneck, y_pred] + tail_results)
+
+    def _run_step(
+        self,
+        batch,
+        batch_idx,
+        train=False,
+        intervention_idxs=None,
+        **kwargs,
+    ):
+        x, y, (c, g, competencies, prev_interventions) = self._unpack_batch(batch)
+        outputs = self._forward(
+            x,
+            intervention_idxs=intervention_idxs,
+            c=c,
+            y=y,
+            train=train,
+            competencies=competencies,
+            prev_interventions=prev_interventions,
+            **kwargs,
+        )
+        c_sem, bottleneck, y_logits = outputs[0], outputs[1], outputs[2]
+
+        # ---- extra logging metrics (CEM) ----
+        B = c_sem.shape[0]
+        _, total_diversity = batch_diversity(c_sem)
+
+        # <c_i, W[y_i, :]> averaged over batch.
+        # For CEM, c2y_model typically takes flattened embeddings of size K*emb_size.
+        # We derive a per-class per-concept weight by reshaping the (n_tasks, K*emb)
+        # matrix into (n_tasks, K, emb) and averaging over emb.
+        concept_label_dot = 0.0
+        W_concept = None
+        linear = None
+        if isinstance(self.c2y_model, torch.nn.Sequential):
+            # Only use this when the sequential is a single Linear layer.
+            if len(self.c2y_model) == 1 and isinstance(self.c2y_model[0], torch.nn.Linear):
+                linear = self.c2y_model[0]
+        elif isinstance(self.c2y_model, torch.nn.Linear):
+            linear = self.c2y_model
+
+        if (linear is not None) and hasattr(linear, "weight"):
+            W_flat = linear.weight  # (n_tasks, in_features)
+            if W_flat.dim() == 2:
+                if W_flat.shape[1] == self.n_concepts:
+                    W_concept = W_flat
+                elif W_flat.shape[1] == self.n_concepts * self.emb_size:
+                    W_concept = W_flat.view(self.n_tasks, self.n_concepts, self.emb_size).mean(dim=-1)
+
+        if (W_concept is not None) and (y is not None):
+            y_idx = y.to(dtype=torch.long).reshape(-1)
+            valid = (y_idx != 1000)
+            if valid.any():
+                c_norm = F.normalize(c_sem, dim=1)
+                W_y = F.normalize(W_concept[y_idx[valid]], dim=1)
+                concept_label_dot = torch.einsum("bk,bk->b", c_norm[valid], W_y).mean().item()
+
+        meters = self.train_meters if train else self.val_meters
+        if (meters is not None) and ("diversity" in meters):
+            meters["diversity"].update(float(total_diversity.item()), B)
+        if (meters is not None) and ("concept_label_dot" in meters):
+            meters["concept_label_dot"].update(float(concept_label_dot), int(B))
+
+        # ---- losses ----
+        if self.task_loss_weight != 0:
+            task_loss = self.loss_task(
+                y_logits if y_logits.shape[-1] > 1 else y_logits.reshape(-1),
+                y.long(),
+            )
+            task_loss_scalar = task_loss.detach()
+        else:
+            task_loss = torch.tensor(0.0, device=y_logits.device)
+            task_loss_scalar = task_loss.item()
+
+        if self.concept_loss_weight != 0:
+            concept_loss = self.loss_concept(c_sem, c)
+            concept_loss_scalar = concept_loss.detach()
+        else:
+            concept_loss = torch.tensor(0.0, device=y_logits.device)
+            concept_loss_scalar = concept_loss.item()
+
+        loss = (
+            self.concept_loss_weight * concept_loss +
+            task_loss +
+            self._extra_losses(
+                x=x,
+                y=y,
+                c=c,
+                y_pred=y_logits,
+                c_sem=c_sem,
+                c_pred=bottleneck,
+                competencies=competencies,
+                prev_interventions=prev_interventions,
+            )
+        )
+
+        # ---- metrics ----
+        (c_accuracy, c_auc, c_f1), (y_accuracy, y_auc, y_f1) = compute_accuracy(
+            c_sem,
+            y_logits,
+            c,
+            y,
+        )
+        result = {
+            "c_accuracy": c_accuracy,
+            "c_auc": c_auc,
+            "c_f1": c_f1,
+            "y_accuracy": y_accuracy,
+            "y_auc": y_auc,
+            "y_f1": y_f1,
+            "concept_loss": concept_loss_scalar,
+            "task_loss": task_loss_scalar,
+            "loss": loss.detach(),
+            "avg_c_y_acc": (c_accuracy + y_accuracy) / 2,
+            "diversity": float(total_diversity.item()),
+            "concept_label_dot": float(concept_label_dot),
+        }
+        return loss, result
+
+    def validation_step(self, batch, batch_no):
+        _, result = self._run_step(batch, batch_no, train=False)
+        for name, val in result.items():
+            if self.n_tasks <= 2:
+                prog_bar = (("auc" in name))
+            else:
+                prog_bar = (("c_auc" in name) or ("y_accuracy" in name))
+            self.log("val_" + name, val, prog_bar=prog_bar)
+        result = {"val_" + key: val for key, val in result.items()}
+        return result
 
 
 

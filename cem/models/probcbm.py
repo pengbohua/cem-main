@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torchvision.models import resnet18
 
 from cem.metrics.accs import compute_accuracy
-from cem.models.cbm import ConceptBottleneckModel
+from cem.models.cbm import AverageMeter, ConceptBottleneckModel, batch_diversity
 import cem.train.utils as utils
 
 
@@ -839,6 +839,15 @@ class ProbCBM(ProbConceptModel, ConceptBottleneckModel):
         self.output_interventions = output_interventions
         self.output_latent = output_latent
         self.lr_ratio = lr_ratio
+        self._init_meters()
+
+    def _init_meters(self):
+        keys = [
+            "diversity",
+            "concept_label_dot",
+        ]
+        self.train_meters = {k: AverageMeter() for k in keys}
+        self.val_meters = {k: AverageMeter() for k in keys}
 
     def _train_step(
         self,
@@ -983,6 +992,40 @@ class ProbCBM(ProbConceptModel, ConceptBottleneckModel):
             "loss": float(loss.detach().cpu().numpy()) if not isinstance(loss, float) else loss,
             "avg_c_y_acc": (c_accuracy + y_accuracy) / 2,
         }
+
+        # --- meters: batch_diversity + <c_i, W[y_i, :]> ---
+        # Does not affect forward outputs; only updates AverageMeters.
+        meters = getattr(self, "train_meters", None) if train else getattr(self, "val_meters", None)
+        if meters:
+            B = int(c_sem.shape[0])
+
+            if "diversity" in meters:
+                _, total_diversity = batch_diversity(c_sem)
+                meters["diversity"].update(float(total_diversity.item()), B)
+
+            # Treat `self.class_mean` as the class-specific concept weight matrix
+            # (i.e., analogous to CBM's `c2y_model.weight`). Only valid when
+            # not using concept-derived class embeddings.
+            if (
+                (not getattr(self, "use_class_emb_from_concept", False)) and
+                ("concept_label_dot" in meters) and
+                hasattr(self, "class_mean")
+            ):
+                W = self.class_mean
+                # Require W to be (n_tasks, K) so it matches c_sem (B, K)
+                if (
+                    torch.is_tensor(W) and W.dim() == 2 and
+                    W.shape[1] == c_sem.shape[1]
+                ):
+                    y_idx = y.reshape(-1).long()
+                    valid = (y_idx != 1000) & (y_idx >= 0) & (y_idx < W.shape[0])
+                    if bool(valid.any()):
+                        c_norm = F.normalize(c_sem.detach(), dim=-1)
+                        W_y = F.normalize(W[y_idx[valid]], dim=-1)
+                        concept_label_dot = (
+                            (c_norm[valid] * W_y).sum(dim=-1)
+                        ).mean().item()
+                        meters["concept_label_dot"].update(float(concept_label_dot), B)
         if self.top_k_accuracy is not None:
             y_true = y.reshape(-1).cpu().detach()
             y_pred = y_probs.cpu().detach()
@@ -997,6 +1040,25 @@ class ProbCBM(ProbConceptModel, ConceptBottleneckModel):
                 result[f'y_top_{top_k_val}_accuracy'] = y_top_k_accuracy
         return loss, result
 
+    def validation_step(self, batch, batch_no):
+        _, result = self._run_step(
+            batch,
+            batch_no,
+            train=False,
+        )
+        self.log("val/loss", result.get("loss", 0), prog_bar=True)
+        for name, val in result.items():
+            if self.n_tasks <= 2:
+                prog_bar = (("auc" in name))
+            else:
+                prog_bar = (("c_auc" in name) or ("y_accuracy" in name))
+            self.log("val_" + name, val, prog_bar=prog_bar)
+        result = {
+            "val_" + key: val
+            for key, val in result.items()
+        }
+        return result
+    
     def _forward(
         self,
         x,

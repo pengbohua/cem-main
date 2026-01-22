@@ -144,9 +144,9 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         )
 
         if not hasattr(self, "N1"):
-            self.register_buffer("N1", torch.zeros(self.n_concepts, device='cuda'))
+            self.register_buffer("N1", torch.zeros(self.n_concepts))
         if not hasattr(self, "N0"):
-            self.register_buffer("N0", torch.zeros(self.n_concepts, device='cuda'))
+            self.register_buffer("N0", torch.zeros(self.n_concepts))
         if not hasattr(self, "ema"):
             self.ema = 0.9
         # Let's generate the global embeddings we will use
@@ -234,7 +234,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                 )
         self.sample_c_preds = sample_c_preds
         self.beta_max = beta_max
-
+        self._init_meters()
     def _uncertainty_based_context_addition(self, concept_probs, temperature=1):
         # We only select to add a context when the uncertainty is far from the extremes
         # 当不确定性大（信息量小）的时候，用context（residual）来补充概念表示
