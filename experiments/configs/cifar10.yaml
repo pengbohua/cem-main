@@ -1,8 +1,8 @@
 trials: 1
-results_dir: results/cifar10_complete_115/
+results_dir: results/cifar10_complete_122/
 
 shared_params:
-  results_dir: "results/cifar10_complete_115/"
+  results_dir: "results/cifar10_complete_122/"
   trials: 1
   model_selection_trials: 3
   dataset_config:
@@ -30,18 +30,9 @@ shared_params:
         group_level: true
         use_prior: false
   eval_config:
-    additional_metrics:
-      - name: "mixcem_sel"
-        include_list: [".*(MixCEM_).*"]
-    additional_test_sets:
-      - name: "OOD_sap_0.1"
-        update_previous: true
-        dataset_config:
-          test_transformation_config:
-            post_generation: false
-            name: "salt_and_pepper"
-            amount: 0.1
-            s_vs_p: 0.5
+    additional_metrics: []
+    additional_test_sets: []
+  check_val_every_n_epoch: 1
   skip_repr_evaluation: true
   max_epochs: 50
   top_k_accuracy: null
@@ -53,6 +44,7 @@ shared_params:
   learning_rate: 0.01
   weight_decay: 1.0e-06
   weight_loss: true
+  warmup_epochs: 5
   c_extractor_arch: "resnet18"
   optimizer: "sgd"
   bool: false
@@ -64,155 +56,134 @@ shared_params:
   training_intervention_prob: 0
   num_load_workers: 8
 runs:
-   - architecture: "MixCEM"
-     run_name: "MixCEM KL"
-     max_epochs: 150
-     concept_loss_weight: 1
-     training_intervention_prob: 0.25
-     sample_c_preds: true
-     kl_ratio: 0.01
-     beta_max: 10
-     load_path_name: "MixCEM_r_0.1_g_ood_0.5_cwl_1_ce_0"
-     all_intervened_loss_weight: 0.1
-     ood_dropout_prob: 0.5
-     calibration_epochs: 0
+  - architecture: "MixCEM"
+    run_name: "MixCEM KL"
+    max_epochs: 150
+    concept_loss_weight: 1
+    training_intervention_prob: 0.25
+    sample_c_preds: true
+    kl_ratio: 0.01
+    beta_max: 10
+    load_path_name: "MixCEM_r_0.1_g_ood_0.5_cwl_1_ce_0"
+    all_intervened_loss_weight: 0.1
+    ood_dropout_prob: 0.5
+    calibration_epochs: 0
+
+  - architecture: "MixCEM"
+    run_name: "MixCEM NO KL"
+    max_epochs: 150
+    concept_loss_weight: 1
+    training_intervention_prob: 0.25
+    sample_c_preds: false
+    kl_ratio: 0.0
+    beta_max: 10
+    load_path_name: "MixCEM_r_0.1_g_ood_0.5_cwl_1_ce_0"
+    all_intervened_loss_weight: 0.1
+    ood_dropout_prob: 0.5
+    calibration_epochs: 0
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint CBM KL"
+    sample_c_preds: true
+    kl_ratio: 0.01
+    beta_max: 10
+    concept_loss_weight: 10
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint CBM NO KL"
+    sample_c_preds: false
+    kl_ratio: 0.0
+    beta_max: 10
+    concept_loss_weight: 10
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint Logit CBM KL"
+    sample_c_preds: true
+    kl_ratio: 0.01
+    beta_max: 10
+    concept_loss_weight: 10
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint Logit CBM NO KL"
+    sample_c_preds: false
+    kl_ratio: 0.0
+    beta_max: 10
+    concept_loss_weight: 10
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "SequentialConceptBottleneckModel"
+    run_name: "Sequential CBM KL"
+    sample_c_preds: true
+    kl_ratio: 0.01
+    beta_max: 10
+    concept_loss_weight: 1
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "SequentialConceptBottleneckModel"
+    run_name: "Sequential CBM NO KL"
+    sample_c_preds: false
+    kl_ratio: 0.0
+    beta_max: 10
+    concept_loss_weight: 1
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
 
 
-#  - architecture: "ConceptBottleneckModel"
-#    run_name: "DNN"
-#    extra_dims: 100
-#    concept_loss_weight: 0
-#    sigmoidal_prob: true
-#    embedding_activation: "leakyrelu"
-# - architecture: "ConceptBottleneckModel"
-#   run_name: "Joint CBM"
-#   concept_loss_weight: 10
-#   kl_ratio: 0.01
-#   beta_max: 10
-#   sample_c_preds: false
-#   sigmoidal_prob: true
-#   embedding_activation: "leakyrelu"
-#   sigmoidal_extra_capacity: false
-#
-# - architecture: "ConceptBottleneckModel"
-#   run_name: "Joint Logit CBM"
-#   concept_loss_weight: 10
-#   sample_c_preds: false
-#   kl_ratio: 0.01
-#   beta_max: 10
-#   embedding_activation: "leakyrelu"
-#   sigmoidal_extra_capacity: false
-#
-# - architecture: "SequentialConceptBottleneckModel"
-#   run_name: "Sequential CBM"
-#   concept_loss_weight: 1
-#   sample_c_preds: false
-#   sigmoidal_prob: true
-#   embedding_activation: "leakyrelu"
-#   sigmoidal_extra_capacity: false
-#
-# - architecture: "IndependentConceptBottleneckModel"
-#   run_name: "Independent CBM"
-#   concept_loss_weight: 1
-#   sample_c_preds: false
-#   sigmoidal_prob: true
-#   embedding_activation: "leakyrelu"
-#   sigmoidal_extra_capacity: false
-#
-# - architecture: "ConceptBottleneckModel"
-#   run_name: "Hybrid-CBM"
-#   extra_dims: 50
-#   concept_loss_weight: 1
-#   sample_c_preds: false
-#   sigmoidal_prob: true
-#   embedding_activation: "leakyrelu"
-#
-# - architecture: "ConceptEmbeddingModel"
-#   run_name: "CEM"
-#   concept_loss_weight: 1
-#   sample_c_preds: false
-#   sigmoidal_prob: true
-#   training_intervention_prob: 0.25
-#   embedding_activation: "leakyrelu"
+  - architecture: "IndependentConceptBottleneckModel"
+    run_name: "Independent CBM KL"
+    sample_c_preds: true
+    kl_ratio: 0.01
+    beta_max: 10
+    concept_loss_weight: 1
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
 
-#  - architecture: "IntAwareConceptEmbeddingModel"
-#    run_name: "BayesIntCEM"
-#    concept_loss_weight: 1
-#    training_intervention_prob: 0.25
-#    intervention_weight: 5
-#    intervention_task_discount: 1.1
-#    use_concept_groups: true
-#    int_model_use_bn: true
-#    int_model_layers: [128, 128, 64, 64]
-#    embedding_activation: "leakyrelu"
-#    max_horizon: 6
-#    horizon_rate: 1.005
-#    gradient_clip_val: 100
+  - architecture: "IndependentConceptBottleneckModel"
+    run_name: "Independent CBM NO KL"
+    sample_c_preds: false
+    kl_ratio: 0.0
+    beta_max: 10
+    concept_loss_weight: 1
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
 
+  - architecture: "ConceptEmbeddingModel"
+    run_name: "CEM"
+    concept_loss_weight: 1
+    sigmoidal_prob: true
+    training_intervention_prob: 0.25
+    embedding_activation: "leakyrelu"
 
-#  - architecture: "ProbabilisticConceptBottleneckModel"
-#    run_name: "ProbCBM"
-#    concept_loss_weight: 1
-#    n_samples_inference: 50
-#    use_neg_concept: true
-#    pred_class: true
-#    init_negative_scale: 5
-#    init_shift: 5
-#    pretrained: true
-#    hidden_dim: 16
-#    class_hidden_dim: 64
-#    intervention_prob: 0.5
-#    gradient_clip_val: 2.0
-#    max_concept_epochs: 50
-#    warmup_epochs: 5
-#    max_task_epochs: 50
-#    vib_beta: 5.0e-05
-#    lr_ratio: 10
-
-#  - architecture: "PosthocConceptBottleneckModel"
-#    run_name: "Posthoc CBM"
-#    emb_size: null
-#    residual: false
-#    reg_strength: 1.0e-06
-#    l1_ratio: 0.99
-#    freeze_pretrained_model: true
-#    freeze_concept_embeddings: true
-#    svd_penalty: 1
-#    active_top_percentile: 95
-#    active_bottom_percentile: 5
-#    blackbox_model_config:
-#      name: "resnet18"
-#      imagenet_pretrained: true
-#      add_linear_layers: [19]
-#    blackbox_training_epochs: 50
-#    max_residual_epochs: 50
-#    blackbox_path: "PCBM_BlackBox_Model_resnet18_pre_True_layers_[19]"
-#    cav_path: "results/cifar10//PCBM_CAVs_resnet18_pre_True_layers_[19].npy"
-#    intercept_path: "results/cifar10//PCBM_Intercepts_resnet18_pre_True_layers_[19].npy"
-
-#  - architecture: "PosthocConceptBottleneckModel"
-#    run_name: "Posthoc Hybrid CBM"
-#    emb_size: null
-#    residual: true
-#    reg_strength: 0.001
-#    l1_ratio: 0.99
-#    freeze_pretrained_model: true
-#    freeze_concept_embeddings: true
-#    svd_penalty: 1
-#    blackbox_model_config:
-#      name: "resnet18"
-#      imagenet_pretrained: true
-#      add_linear_layers: [19]
-#    blackbox_training_epochs: 50
-#    max_residual_epochs: 50
-#    blackbox_path: "PCBM_BlackBox_Model_resnet18_pre_True_layers_[19]"
-#    cav_path: "results/cifar10//PCBM_CAVs_resnet18_pre_True_layers_[19].npy"
-#    intercept_path: "results/cifar10//PCBM_Intercepts_resnet18_pre_True_layers_[19].npy"
-#
-#  - architecture: "ConceptToLabelModel"
-#    run_name: "Bayes MLP"
-#    max_epochs: 75
-#    c2y_layers: [256, 128, 64, 32]
-#    feature_drop_out: 0.25
-
+  - architecture: "ProbabilisticConceptBottleneckModel"
+    run_name: "ProbCBM"
+    concept_loss_weight: 1
+    n_samples_inference: 50
+    use_neg_concept: true
+    pred_class: true
+    init_negative_scale: 5
+    init_shift: 5
+    pretrained: true
+    hidden_dim: 16
+    class_hidden_dim: 64
+    intervention_prob: 0.5
+    gradient_clip_val: 2.0
+    max_concept_epochs: 50
+    warmup_epochs: 5
+    max_task_epochs: 50
+    vib_beta: 5.0e-05
+    lr_ratio: 10
 
