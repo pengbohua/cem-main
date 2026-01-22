@@ -8,7 +8,7 @@ shared_params:
   dataset_config:
     dataset: "cub"
     num_workers: 8
-    batch_size: 256
+    batch_size: 384
     root_dir: "cem/data/CUB200" # REPLACE ME
     sampling_percent: 1
     sampling_groups: true
@@ -60,7 +60,7 @@ shared_params:
   emb_size: 16
   extra_dims: 0
   concept_loss_weight: [1, 5, 10]
-  learning_rate: 0.02
+  learning_rate: 0.015
   weight_decay: 1e-5
   weight_loss: true
   warmup_epochs: 5
@@ -70,7 +70,7 @@ shared_params:
   early_stopping_monitor: "val_loss"
   early_stopping_mode: "min"
   early_stopping_delta: 0.0
-  momentum: 0.8
+  momentum: 0.9
   sigmoidal_prob: false
   training_intervention_prob: 0
   num_load_workers: 8
