@@ -486,6 +486,7 @@ def construct_model(
             "x2c_model": x2c_model,
             "c2y_model": c2y_model,
             "c2y_layers": config.get("c2y_layers", []),
+            "topk_concepts_path": config.get("topk_concepts_path", None),
         }
 
     elif (

@@ -53,15 +53,15 @@ shared_params:
 #            s_vs_p: 0.5
   check_val_every_n_epoch: 1
   skip_repr_evaluation: true
-  max_epochs: 150
+  max_epochs: 40
   top_k_accuracy: null
   save_model: true
   patience: 15
   emb_size: 16
   extra_dims: 0
   concept_loss_weight: [1, 5, 10]
-  learning_rate: 0.015
-  weight_decay: 1e-5
+  learning_rate: 0.02
+  weight_decay: 1.0e-5
   weight_loss: true
   warmup_epochs: 5
   c_extractor_arch: "resnet18"
@@ -98,6 +98,44 @@ runs:
     beta_max: 10
     calibration_epochs: 0
 
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint Logit CBM KL"
+    concept_loss_weight: 10
+    kl_ratio: 0.01
+    beta_max: 10
+    sample_c_preds: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint Logit CBM NOKL"
+    concept_loss_weight: 10
+    kl_ratio: 0.0
+    beta_max: 10
+    sample_c_preds: false
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint CBM KL"
+    concept_loss_weight: 10
+    kl_ratio: 0.01
+    beta_max: 10
+    sample_c_preds: true
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
+  - architecture: "ConceptBottleneckModel"
+    run_name: "Joint CBM NOKL"
+    concept_loss_weight: 10
+    kl_ratio: 0.0
+    beta_max: 10
+    sample_c_preds: false
+    sigmoidal_prob: true
+    embedding_activation: "leakyrelu"
+    sigmoidal_extra_capacity: false
+
   - architecture: "ProbabilisticConceptBottleneckModel"
     run_name: "ProbCBM"
     concept_loss_weight: 1
@@ -121,44 +159,6 @@ runs:
     vib_beta: 5.0e-05
     lr_ratio: 10
 
-  - architecture: "ConceptBottleneckModel"
-    run_name: "Joint Logit CBM Bayes"
-    concept_loss_weight: 10
-    kl_ratio: 0.01
-    beta_max: 10
-    sample_c_preds: true
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
-
-  - architecture: "ConceptBottleneckModel"
-    run_name: "Joint Logit CBM Det"
-    concept_loss_weight: 10
-    kl_ratio: 0.0
-    beta_max: 10
-    sample_c_preds: false
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
-
-  - architecture: "ConceptBottleneckModel"
-    run_name: "Joint CBM Bayes"
-    concept_loss_weight: 10
-    kl_ratio: 0.01
-    beta_max: 10
-    sample_c_preds: true
-    sigmoidal_prob: true
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
-
-  - architecture: "ConceptBottleneckModel"
-    run_name: "Joint CBM Det"
-    concept_loss_weight: 10
-    kl_ratio: 0.0
-    beta_max: 10
-    sample_c_preds: false
-    sigmoidal_prob: true
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
-
   - architecture: "ConceptEmbeddingModel"
     run_name: "CEM"
     sigmoidal_prob: true
@@ -166,32 +166,7 @@ runs:
     concept_loss_weight: 1
     embedding_activation: "leakyrelu"
 
-  - architecture: "ConceptBottleneckModel"
-    run_name: "Joint CBM"
-    concept_loss_weight: 10
-    sigmoidal_prob: true
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
 
-  - architecture: "ConceptBottleneckModel"
-    run_name: "Joint Logit CBM"
-    concept_loss_weight: 10
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
-
-  - architecture: "SequentialConceptBottleneckModel"
-    run_name: "Sequential CBM"
-    concept_loss_weight: 1
-    sigmoidal_prob: true
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
-
-  - architecture: "IndependentConceptBottleneckModel"
-    run_name: "Independent CBM"
-    concept_loss_weight: 1
-    sigmoidal_prob: true
-    embedding_activation: "leakyrelu"
-    sigmoidal_extra_capacity: false
 
 #  - architecture: "ConceptBottleneckModel"
 #    run_name: "DNN Det"

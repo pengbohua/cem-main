@@ -2,11 +2,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import sklearn.metrics
-
+from cem.models.cbm import _get_last_linear
 from torchvision.models import resnet50
-
+import torch.nn as nn
 import cem.train.utils as utils
 from cem.models.intcbm import IntAwareConceptEmbeddingModel
+from cem.metrics.accs import compute_accuracy
+from cem.models.cbm import AverageMeter, batch_diversity
 
 
 class MixCEM(IntAwareConceptEmbeddingModel):
@@ -86,6 +88,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             max_horizon=1,
             initial_horizon=2,
             horizon_rate=1,
+            topk_concepts_path=None,
     ):
         self.temperature = temperature
         self._context_scale_factors = None
@@ -100,6 +103,38 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         self.output_uncertainty = output_uncertainty
         self.kl_ratio = kl_ratio
         self._mixed_stds = None
+        self.topk_concepts_path = topk_concepts_path
+        self.topk_concepts_of_class = None
+        if topk_concepts_path is not None:
+            loaded = torch.load(topk_concepts_path, map_location="cpu")
+            if isinstance(loaded, dict):
+                rows = []
+                topk_len = None
+                for cls in range(n_tasks):
+                    v = loaded.get(cls, None)
+                    if v is None:
+                        v = loaded.get(str(cls), None)
+                    if v is None:
+                        raise ValueError(
+                            f"Missing topk indices for class {cls} in {topk_concepts_path}"
+                        )
+                    t = torch.as_tensor(v, dtype=torch.long).reshape(-1)
+                    if topk_len is None:
+                        topk_len = int(t.numel())
+                    if int(t.numel()) != topk_len:
+                        raise ValueError(
+                            f"Inconsistent topk sizes in {topk_concepts_path}: "
+                            f"expected {topk_len} but class {cls} has {int(t.numel())}"
+                        )
+                    rows.append(t)
+                self.topk_concepts_of_class = torch.stack(rows, dim=0)  # (n_tasks, topk)
+            else:
+                t = torch.as_tensor(loaded, dtype=torch.long)
+                if t.dim() != 2:
+                    raise ValueError(
+                        f"Expected topk_concepts_of_class to be 2D (n_tasks, topk) but got {tuple(t.shape)}"
+                    )
+                self.topk_concepts_of_class = t
 
         super(MixCEM, self).__init__(
             n_concepts=n_concepts,
@@ -181,6 +216,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             self.c2y_model = torch.nn.Sequential(*layers)
         else:
             self.c2y_model = c2y_model
+
         self.global_c2y_model = self.c2y_model
 
         self.ood_dropout_prob = ood_dropout_prob
@@ -235,6 +271,23 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         self.sample_c_preds = sample_c_preds
         self.beta_max = beta_max
         self._init_meters()
+
+    def _init_meters(self):
+        keys = [
+            "prior_mean",
+            "posterior_mean",
+            "task_loss",
+            "kl",
+            "Em",
+            "Ea",
+            "Eb",
+            "Ea_over_b",
+            "diversity",
+            "concept_label_dot",
+        ]
+        self.train_meters = {k: AverageMeter() for k in keys}
+        self.val_meters = {k: AverageMeter() for k in keys}
+
     def _uncertainty_based_context_addition(self, concept_probs, temperature=1):
         # We only select to add a context when the uncertainty is far from the extremes
         # 当不确定性大（信息量小）的时候，用context（residual）来补充概念表示
@@ -246,6 +299,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
 
     def _predict_labels(self, bottleneck, **task_loss_kwargs):
         outputs = []
+
         if bottleneck.shape[-1] == 2:
             # Then no test time sampling was done!! So let's just use the
             # normal mixed bottleneck. This will always be the first
@@ -441,10 +495,10 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         beta_a_vals = []
         beta_b_vals = []
         for concept_idx in range(self.n_concepts):
-            if self.shared_prob_gen:
+            if self.shared_prob_gen:  # 为所有概念生成相同的先验a, b形成Beta(a, b)
                 beta_a_gen = self.concept_beta_generators[0][0]
                 beta_b_gen = self.concept_beta_generators[0][1]
-            else:
+            else:                    # 为所有概念生成不同的先验a, b形成Beta(a, b)
                 beta_a_gen = self.concept_beta_generators[concept_idx][0]
                 beta_b_gen = self.concept_beta_generators[concept_idx][1]
             if self.hard_selection_value is None:
@@ -455,7 +509,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                 beta_b = beta_b_gen(
                     global_contexts[:, concept_idx, :] +
                     dynamic_contexts[:, concept_idx, :]
-                )
+                )  # B, latent_dim * 2 -> B, 1
             else:
                 # 固定比例缩放dynamic，（global + (1-hard)dynamic）
                 beta_a = beta_a_gen(
@@ -472,7 +526,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                             dynamic_contexts[:, concept_idx, :]
                     )
                 )
-
+            # 根据Beta分布采样生成概率
             # Beta distribution requires strictly positive concentration params.
             beta_a = F.softplus(beta_a) + 1e-4
             beta_b = F.softplus(beta_b) + 1e-4
@@ -485,12 +539,12 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             c_sem.append(prob)
 
         # record beta priors and kl divergence
-        beta_a_vals = torch.cat(beta_a_vals, dim=-1)
-        beta_b_vals = torch.cat(beta_b_vals, dim=-1)
+        beta_a_vals = torch.cat(beta_a_vals, dim=-1) # B, n_concepts
+        beta_b_vals = torch.cat(beta_b_vals, dim=-1) # B, n_concepts
         self._last_beta_a = beta_a_vals
         self._last_beta_b = beta_b_vals
 
-        c_sem = torch.cat(c_sem, axis=-1)
+        c_sem = torch.cat(c_sem, axis=-1) # B, n_concepts c_probs
         # Sanity check + clamp for downstream entropy computations.
         if not torch.isfinite(c_sem).all():
             raise ValueError("Non-finite values found in c_sem (concept probabilities).")
@@ -565,6 +619,94 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             )
         return loss
 
+    def _compute_logging_stats(
+        self,
+        pre_c,
+        beta_a,
+        beta_b,
+        c_pred,
+        y,
+        task_loss,
+        kl_loss,
+        meters,
+        use_precise_posterior=False,
+    ):
+        """
+        beta_a, beta_b: (B, K)
+        c_pred: (B, K)
+        y: (B,)
+        meters: dict of AverageMeter
+        """
+        B, K = c_pred.shape
+
+        # ---------- 1. prior / posterior mean ----------
+        a = beta_a.mean(dim=0)  # K
+        b = beta_b.mean(dim=0)  # K
+        prior_mean = (a / (a + b)).mean().item()
+
+        if use_precise_posterior:
+            post_mean = ((a + self.N1) / (a + b + self.N1 + self.N0)).mean().item()
+        else:
+            # batch posterior
+            m = (c_pred >= 0.5).float()
+            N1 = m.sum(dim=0)
+            N0 = B - N1
+            post_mean = ((a + N1) / (a + b + N1 + N0)).mean().item()
+
+        # ---------- 2. E[m] ----------
+        Em = (c_pred >= 0.5).float().mean().item()
+
+        # ---------- 3. Beta parameter expectations ----------
+        Ea = a.mean().item()
+        Eb = b.mean().item()
+        Ea_over_b = (a / (a+b + 1e-6)).mean().item()
+
+        # ---------- 4. batch diversity ----------
+        diversity, total_diversity = batch_diversity(c_pred)
+
+
+        # ---------- 5. topk_concept_cosine_similarity cosine(c_i, Wgk) ----------
+        topk_concept_cosine_similarity = None
+        if (self.topk_concepts_of_class is not None) and (pre_c is not None):
+            # (B, topk)
+            y_to_topk_concept_indices = self.topk_concepts_of_class.to(y.device)[y.long()]
+
+            # Prefer x2c_model.fc.weight as requested; fallback to last Linear.
+            x2c_last = getattr(self.x2c_model, "fc", None)
+            print("x2c fc", x2c_last)
+            if not isinstance(x2c_last, nn.Linear):
+                x2c_last = _get_last_linear(self.x2c_model)
+
+            if (x2c_last is not None) and hasattr(x2c_last, "weight"):
+                W_full = x2c_last.weight  # (out_dim, F)
+                W_c = W_full[: self.n_concepts]
+                W_topk_c = W_c[y_to_topk_concept_indices]  # (B, topk, F)
+
+                # Vectorized cosine similarity and average score in [0, 1].
+                W_hat = F.normalize(W_topk_c, dim=-1)
+                pre_hat = F.normalize(pre_c, dim=-1).unsqueeze(1)  # (B, 1, F)
+                cos_sim = (W_hat * pre_hat).sum(dim=-1)  # (B, topk)
+                topk_concept_cosine_similarity = ((cos_sim + 1.0) / 2.0).mean()
+
+        else:
+            W = self.c2y_model[1].weight    # (n_tasks, n_concepts x F)
+            W_y = W[y]                      # y: (B,) -> (B, n_concepts x F)
+            W_y = F.normalize(W_y, dim=1)
+            pre_c = F.normalize(pre_c.view(B, -1), dim=1)
+            topk_concept_cosine_similarity = torch.einsum("bk,bk->b", pre_c, W_y
+                                                              ).mean().item()  # dot product row by row <c_i, W[y_i, :]>
+
+        meters["prior_mean"].update(prior_mean, B)
+        meters["posterior_mean"].update(post_mean, B)
+        meters["task_loss"].update(task_loss.item(), B)
+        meters["kl"].update(kl_loss.item(), B)
+        meters["Em"].update(Em, B)
+        meters["Ea"].update(Ea, B)
+        meters["Eb"].update(Eb, B)
+        meters["Ea_over_b"].update(Ea_over_b, B)
+        meters["diversity"].update(float(total_diversity.item()), B)
+        meters["concept_label_dot"].update(topk_concept_cosine_similarity, B)
+
     def _run_step(
             self,
             batch,
@@ -594,6 +736,7 @@ class MixCEM(IntAwareConceptEmbeddingModel):
         c_sem = outputs[0]  # Concept probabilities from Beta distribution
         bottleneck = outputs[1]  # Mixed concept embeddings
         y_logits = outputs[2]  # Task predictions
+        self._last_pre_c = self.c2y_model[0](bottleneck[:, :, :, 2])
 
         # Compute concept loss
         if self.concept_loss_weight != 0:
@@ -614,8 +757,8 @@ class MixCEM(IntAwareConceptEmbeddingModel):
             task_loss = torch.tensor(0.0, device=y_logits.device)
             task_loss_scalar = task_loss.item()
 
-        beta_a = getattr(self, "_last_beta_a", None)
-        beta_b = getattr(self, "_last_beta_b", None)
+        beta_a = getattr(self, "_last_beta_a", None)    # B, n_concepts
+        beta_b = getattr(self, "_last_beta_b", None)    # B, n_concepts
         kl_loss = self.beta_kl(beta_a, beta_b, c_sem)   # KL divergence
 
         # Compute total loss with extra losses
@@ -635,15 +778,26 @@ class MixCEM(IntAwareConceptEmbeddingModel):
                 )
         )
 
-        # Compute accuracy metrics
-        from cem.metrics.accs import compute_accuracy
+        meters = self.train_meters if train else self.val_meters
+        pre_c = getattr(self, "_last_pre_c", None)
+        self._compute_logging_stats(
+            pre_c=pre_c,
+            beta_a=beta_a,
+            beta_b=beta_b,
+            c_pred=c_sem,
+            y=y,
+            task_loss=task_loss,
+            kl_loss=kl_loss,
+            meters=meters,
+            use_precise_posterior=use_precise_posterior,
+        )
+
         (c_accuracy, c_auc, c_f1), (y_accuracy, y_auc, y_f1) = compute_accuracy(
             c_sem,
             y_logits,
             c,
             y,
         )
-
         result = {
             "c_accuracy": c_accuracy,
             "c_auc": c_auc,

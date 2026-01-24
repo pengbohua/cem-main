@@ -1,5 +1,6 @@
 import sklearn.metrics
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchvision.models import resnet50
@@ -69,6 +70,59 @@ def batch_diversity(c_repr: torch.Tensor):
     total_diversity = 1.0 - diversity.mean()
     return diversity, total_diversity
 
+def topk_attributes_class_similarity(w_g: torch.Tensor,
+                                       x: torch.Tensor,
+                                       eps: float = 1e-8):
+    """
+    w_g: [B, topk, F]  (classifier weights for class g over K attributes)
+    x:   [B, F]  (attribute features for current sample)
+    topk: int    (use first topk attributes; assume already selected/sorted)
+    return: scalar in [0,1]
+    """
+    # Vectorized cosine similarity.
+    # w_g: (B, topk, D), x: (B, D)
+    if w_g.dim() != 3:
+        raise ValueError(f"Expected w_g to have shape (B, topk, D) but got {tuple(w_g.shape)}")
+    if x.dim() != 2:
+        raise ValueError(f"Expected x to have shape (B, D) but got {tuple(x.shape)}")
+
+    w_hat = F.normalize(w_g, dim=-1, eps=eps)
+    x_hat = F.normalize(x, dim=-1, eps=eps).unsqueeze(1)  # (B, 1, D)
+    cos_sim = (w_hat * x_hat).sum(dim=-1)  # (B, topk) in [-1, 1]
+    s01 = (cos_sim + 1.0) / 2.0
+    return s01.mean()
+
+
+def _get_last_linear(module: nn.Module):
+    last = None
+    for _, m in module.named_modules():
+        if isinstance(m, nn.Linear):
+            last = m
+    return last
+
+
+def _forward_with_pre_fc(model: nn.Module, x: torch.Tensor):
+    """Run model(x) and also capture the input to the last Linear layer."""
+    if hasattr(model, "fc") and isinstance(getattr(model, "fc"), nn.Linear):
+        linear = getattr(model, "fc")
+    else:
+        linear = _get_last_linear(model)
+
+    pre = {"val": None}
+    handle = None
+
+    if linear is not None:
+        def _hook(_m, inputs, _outputs):
+            if inputs and torch.is_tensor(inputs[0]):
+                pre["val"] = inputs[0]
+
+        handle = linear.register_forward_hook(_hook)
+
+    out = model(x)
+    if handle is not None:
+        handle.remove()
+
+    return out, pre["val"]
 
 class ConceptBottleneckModel(pl.LightningModule):
     def __init__(
@@ -107,6 +161,7 @@ class ConceptBottleneckModel(pl.LightningModule):
         use_concept_groups=False,
         kl_ratio=0.1,
         top_k_accuracy=None,
+        topk_concepts_path=None,
     ):
         """
         Constructs a joint Concept Bottleneck Model (CBM) as defined by
@@ -316,6 +371,41 @@ class ConceptBottleneckModel(pl.LightningModule):
         self.sigmoidal_prob = sigmoidal_prob
         self.sigmoidal_extra_capacity = sigmoidal_extra_capacity
         self.use_concept_groups = use_concept_groups
+        self.topk_concepts_path = topk_concepts_path
+        self.topk_concepts_of_class = None
+        if topk_concepts_path is not None:
+            # Expected formats:
+            # - Tensor of shape (n_tasks, topk)
+            # - Dict[int, Tensor/list] mapping class -> indices
+            loaded = torch.load(topk_concepts_path, map_location="cpu")
+            if isinstance(loaded, dict):
+                rows = []
+                topk_len = None
+                for cls in range(self.n_tasks):
+                    v = loaded.get(cls, None)
+                    if v is None:
+                        v = loaded.get(str(cls), None)
+                    if v is None:
+                        raise ValueError(
+                            f"Missing topk indices for class {cls} in {topk_concepts_path}"
+                        )
+                    t = torch.as_tensor(v, dtype=torch.long).reshape(-1)
+                    if topk_len is None:
+                        topk_len = int(t.numel())
+                    if int(t.numel()) != topk_len:
+                        raise ValueError(
+                            f"Inconsistent topk sizes in {topk_concepts_path}: "
+                            f"expected {topk_len} but class {cls} has {int(t.numel())}"
+                        )
+                    rows.append(t)
+                self.topk_concepts_of_class = torch.stack(rows, dim=0)  # (n_tasks, topk)
+            else:
+                t = torch.as_tensor(loaded, dtype=torch.long)
+                if t.dim() != 2:
+                    raise ValueError(
+                        f"Expected topk_concepts_of_class to be 2D (n_tasks, topk) but got {tuple(t.shape)}"
+                    )
+                self.topk_concepts_of_class = t
         self._init_meters()
 
     def _unpack_batch(self, batch):
@@ -425,6 +515,7 @@ class ConceptBottleneckModel(pl.LightningModule):
 
     def _compute_logging_stats(
         self,
+        pre_c,
         beta_a,
         beta_b,
         c_pred,
@@ -462,24 +553,42 @@ class ConceptBottleneckModel(pl.LightningModule):
         # ---------- 3. Beta parameter expectations ----------
         Ea = a.mean().item()
         Eb = b.mean().item()
-        Ea_over_b = (a / (b + 1e-6)).mean().item()
+        Ea_over_b = (a / (a+b + 1e-6)).mean().item()
 
         # ---------- 4. batch diversity ----------
         diversity, total_diversity = batch_diversity(c_pred)
 
-        # Normalized concepts for downstream dot-products
-        c_norm = F.normalize(c_pred, dim=-1)
 
+        # ---------- 5. topk_concept_cosine_similarity cosine(c_i, Wgk) ----------
+        topk_concept_cosine_similarity = None
+        if (self.topk_concepts_of_class is not None) and (pre_c is not None):
+            # (B, topk)
+            y_to_topk_concept_indices = self.topk_concepts_of_class.to(y.device)[y.long()]
 
-        # ---------- 5. <c_i, W[y_i, :]> ----------
+            # Prefer x2c_model.fc.weight as requested; fallback to last Linear.
+            x2c_last = getattr(self.x2c_model, "fc", None)
+            print("x2c fc", x2c_last)
+            if not isinstance(x2c_last, nn.Linear):
+                x2c_last = _get_last_linear(self.x2c_model)
 
-        W = self.c2y_model[0].weight  # (n_tasks, K)
-        W_y = W[y]  # y: (B,) -> (B, K)
-        W_y = F.normalize(W_y, dim=1)
-        concept_label_dot = torch.einsum("bk,bk->b", c_norm, W_y
-                                         ).mean().item()  # dot product row by row
+            if (x2c_last is not None) and hasattr(x2c_last, "weight"):
+                W_full = x2c_last.weight  # (out_dim, F)
+                W_c = W_full[: self.n_concepts]
+                W_topk_c = W_c[y_to_topk_concept_indices]  # (B, topk, F)
 
-        # ---------- update meters ----------
+                # Vectorized cosine similarity and average score in [0, 1].
+                W_hat = F.normalize(W_topk_c, dim=-1)
+                pre_hat = F.normalize(pre_c, dim=-1).unsqueeze(1)  # (B, 1, F)
+                cos_sim = (W_hat * pre_hat).sum(dim=-1)  # (B, topk)
+                topk_concept_cosine_similarity = ((cos_sim + 1.0) / 2.0).mean()
+        else:
+            W = self.c2y_model[1].weight  # (n_tasks, K)
+            W_y = W[y]  # y: (B,) -> (B, K)
+            W_y = F.normalize(W_y, dim=1)
+            c_norm = F.normalize(c_pred, dim=1)
+            topk_concept_cosine_similarity = torch.einsum("bk,bk->b", c_norm, W_y
+                                             ).mean().item()  # dot product row by row <c_i, W[y_i, :]>
+
         meters["prior_mean"].update(prior_mean, B)
         meters["posterior_mean"].update(post_mean, B)
         meters["task_loss"].update(task_loss.item(), B)
@@ -488,8 +597,8 @@ class ConceptBottleneckModel(pl.LightningModule):
         meters["Ea"].update(Ea, B)
         meters["Eb"].update(Eb, B)
         meters["Ea_over_b"].update(Ea_over_b, B)
-        meters["diversity"].update(float(total_diversity.item()), B)
-        meters["concept_label_dot"].update(concept_label_dot, B)
+        meters["diversity"].update(total_diversity.item(), B)
+        meters["concept_label_dot"].update(topk_concept_cosine_similarity, B)
 
     def _init_meters(self):
         keys = [
@@ -507,7 +616,6 @@ class ConceptBottleneckModel(pl.LightningModule):
 
         self.train_meters = {k: AverageMeter() for k in keys}
         self.val_meters = {k: AverageMeter() for k in keys}
-
     def beta_kl(self, beta_a, beta_b, c_pred, threshold=0.5):
         """
         beta_a, beta_b: prior parameters, shape (B, K) or (K,)
@@ -642,7 +750,9 @@ class ConceptBottleneckModel(pl.LightningModule):
             else self.output_latent
         )
         if latent is None:
-            latent = self.x2c_model(x)
+            latent, pre_c = _forward_with_pre_fc(self.x2c_model, x)
+            # self._last_pre_c = pre_c.detach() if pre_c is not None else None
+            self._last_pre_c = None
         beta_a, beta_b = self._compute_beta_params(latent)
         self._last_beta_a = beta_a
         self._last_beta_b = beta_b
@@ -897,7 +1007,9 @@ class ConceptBottleneckModel(pl.LightningModule):
                 prev_interventions=prev_interventions,
             )
         meters = self.train_meters if train else self.val_meters
+        pre_c = getattr(self, "_last_pre_c", None)
         self._compute_logging_stats(
+            pre_c=pre_c,
             beta_a=beta_a,
             beta_b=beta_b,
             c_pred=c_pred_for_kl,
