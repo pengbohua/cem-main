@@ -2,7 +2,7 @@ import cem.metrics.oracle as purity
 import numpy as np
 import warnings
 
-from sklearn_extra.cluster import KMedoids
+# from sklearn_extra.cluster import KMedoids
 from sklearn.metrics import homogeneity_score
 from tqdm import tqdm
 
